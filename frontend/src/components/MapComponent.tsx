@@ -1,0 +1,653 @@
+﻿import React, { useEffect, useMemo, useRef } from 'react';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+import { RoadNetworkEdge, RoadNetworkNode } from '../services/pathPlanningService';
+import { haversineDistanceArray } from '../utils/geoUtils';
+
+interface MapMarker {
+  id: string;
+  position: [number, number];
+  title: string;
+  type?: string;
+  label?: string;
+}
+
+interface RouteLeg {
+  id: string;
+  points: [number, number][];
+  color?: string;
+  dashArray?: string;
+  title?: string;
+}
+
+interface CongestionSegment {
+  id: string;
+  points: [number, number][];
+  color: string;
+  isActive?: boolean;
+  title?: string;
+  dashArray?: string;
+  opacity?: number;
+  weight?: number;
+  isConnector?: boolean;
+}
+
+interface PathLegendItem {
+  id: string;
+  label: string;
+  color: string;
+  dashArray?: string;
+}
+
+interface MapComponentProps {
+  center?: [number, number];
+  zoom?: number;
+  markers?: MapMarker[];
+  activeMarkerId?: string | null;
+  onMarkerSelect?: (marker: {
+    id: string;
+    position: [number, number];
+    title: string;
+    type?: string;
+    label?: string;
+  }) => void;
+  path?: [number, number][];
+  routeLegs?: RouteLeg[];
+  congestionSegments?: CongestionSegment[];
+  activeRouteLegId?: string | null;
+  focusPoints?: [number, number][];
+  roadNetwork?: {
+    nodes: RoadNetworkNode[];
+    edges: RoadNetworkEdge[];
+  };
+  showRoadNetwork?: boolean;
+  baseMapMode?: 'street' | 'scenic';
+  scenicAreaName?: string | null;
+  routeSource?: 'graph' | 'osrm';
+  showDirectionArrows?: boolean;
+  pathLegendItems?: PathLegendItem[];
+}
+
+const ROAD_TYPE_STYLE: Record<string, { color: string; weight: number; opacity: number; dashArray?: string }> = {
+  main_road: { color: '#64748b', weight: 3, opacity: 0.45, dashArray: '6,6' },
+  bicycle_path: { color: '#0f766e', weight: 2.5, opacity: 0.5, dashArray: '5,5' },
+  electric_cart_route: { color: '#b45309', weight: 2.5, opacity: 0.5, dashArray: '5,5' },
+  connector: { color: '#f59e0b', weight: 2, opacity: 0.3, dashArray: '4,8' },
+  footpath: { color: '#94a3b8', weight: 2, opacity: 0.42, dashArray: '4,6' },
+  side_road: { color: '#cbd5e1', weight: 1.5, opacity: 0.36, dashArray: '4,6' },
+};
+
+const MARKER_STYLE: Record<string, { bg: string; border?: string; text: string; ring?: string }> = {
+  start: { bg: '#16a34a', text: 'S' },
+  end: { bg: '#dc2626', text: 'E' },
+  return: { bg: '#7c3aed', text: 'R', ring: '0 0 0 4px rgba(124,58,237,0.18)' },
+  attraction: { bg: '#7c3aed', text: '景' },
+  facility: { bg: '#f59e0b', text: '设' },
+  waypoint: { bg: '#2563eb', text: '' },
+  default: { bg: '#2563eb', text: '' },
+};
+
+const EDGE_RENDER_LIMIT = 2200;
+const DUPLICATE_MARKER_OFFSET = 0.00012;
+const VIEWPORT_PADDING = 0.0035;
+
+const buildMarkerKey = (position: [number, number]) => `${position[0].toFixed(6)}:${position[1].toFixed(6)}`;
+
+const buildBounds = (points: [number, number][]) => {
+  if (!points.length) return null;
+  let minLat = Number.POSITIVE_INFINITY;
+  let maxLat = Number.NEGATIVE_INFINITY;
+  let minLng = Number.POSITIVE_INFINITY;
+  let maxLng = Number.NEGATIVE_INFINITY;
+
+  for (const [lat, lng] of points) {
+    minLat = Math.min(minLat, lat);
+    maxLat = Math.max(maxLat, lat);
+    minLng = Math.min(minLng, lng);
+    maxLng = Math.max(maxLng, lng);
+  }
+
+  return { minLat, maxLat, minLng, maxLng };
+};
+
+const expandBounds = (
+  bounds: { minLat: number; maxLat: number; minLng: number; maxLng: number },
+  padding: number,
+) => ({
+  minLat: bounds.minLat - padding,
+  maxLat: bounds.maxLat + padding,
+  minLng: bounds.minLng - padding,
+  maxLng: bounds.maxLng + padding,
+});
+
+const isInBounds = (
+  point: [number, number],
+  bounds: { minLat: number; maxLat: number; minLng: number; maxLng: number },
+) =>
+  point[0] >= bounds.minLat &&
+  point[0] <= bounds.maxLat &&
+  point[1] >= bounds.minLng &&
+  point[1] <= bounds.maxLng;
+
+const computeBearing = (from: [number, number], to: [number, number]) => {
+  const toRad = (value: number) => (value * Math.PI) / 180;
+  const toDeg = (value: number) => (value * 180) / Math.PI;
+  const lat1 = toRad(from[0]);
+  const lat2 = toRad(to[0]);
+  const dLng = toRad(to[1] - from[1]);
+  const y = Math.sin(dLng) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+};
+
+const interpolatePoint = (from: [number, number], to: [number, number], ratio: number): [number, number] => [
+  from[0] + (to[0] - from[0]) * ratio,
+  from[1] + (to[1] - from[1]) * ratio,
+];
+
+const buildArrowPoints = (points: [number, number][]) => {
+  if (points.length < 2) return [] as Array<{ position: [number, number]; bearing: number }>;
+
+  const segments: Array<{ from: [number, number]; to: [number, number]; distance: number }> = [];
+  let totalDistance = 0;
+
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const from = points[index];
+    const to = points[index + 1];
+    const distance = haversineDistanceArray(from, to);
+    if (distance < 2) continue;
+    segments.push({ from, to, distance });
+    totalDistance += distance;
+  }
+
+  if (!segments.length || totalDistance < 15) return [];
+
+  const arrowCount = Math.min(5, Math.max(1, Math.round(totalDistance / 180)));
+  const stepDistance = totalDistance / (arrowCount + 1);
+  const arrows: Array<{ position: [number, number]; bearing: number }> = [];
+  let nextTarget = stepDistance;
+  let travelled = 0;
+
+  for (const segment of segments) {
+    while (travelled + segment.distance >= nextTarget && arrows.length < arrowCount) {
+      const ratio = (nextTarget - travelled) / segment.distance;
+      arrows.push({
+        position: interpolatePoint(segment.from, segment.to, ratio),
+        bearing: computeBearing(segment.from, segment.to),
+      });
+      nextTarget += stepDistance;
+    }
+    travelled += segment.distance;
+  }
+
+  if (!arrows.length) {
+    const middle = segments[Math.floor(segments.length / 2)];
+    arrows.push({
+      position: interpolatePoint(middle.from, middle.to, 0.5),
+      bearing: computeBearing(middle.from, middle.to),
+    });
+  }
+
+  return arrows;
+};
+
+const renderLegendHtml = (
+  markers: MapMarker[],
+  showRoadNetwork: boolean,
+  pathLegendItems: PathLegendItem[],
+) => {
+  const hasWaypoint = markers.some((marker) => marker.type === 'waypoint');
+  const hasReturn = markers.some((marker) => marker.type === 'return');
+  const transportLegend = pathLegendItems.map((item) => {
+    const dashStyle = item.dashArray ? `border-top:3px dashed ${item.color};` : `background:${item.color};`;
+    return `<div><span style="display:inline-block;width:18px;height:3px;margin-right:6px;vertical-align:middle;${dashStyle}"></span>${item.label}</div>`;
+  });
+
+  return [
+    '<div style="font-weight:600;margin-bottom:4px;">地图图例</div>',
+    '<div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:#16a34a;color:#fff;text-align:center;line-height:14px;font-size:10px;margin-right:6px;">S</span>导航起点</div>',
+    '<div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:#dc2626;color:#fff;text-align:center;line-height:14px;font-size:10px;margin-right:6px;">E</span>导航终点</div>',
+    hasWaypoint
+      ? '<div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:#2563eb;color:#fff;text-align:center;line-height:14px;font-size:10px;margin-right:6px;">1</span>途经点</div>'
+      : '',
+    hasReturn
+      ? '<div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:#7c3aed;color:#fff;text-align:center;line-height:14px;font-size:10px;margin-right:6px;">R</span>返回起点</div>'
+      : '',
+    ...transportLegend,
+    '<div><span style="display:inline-block;width:18px;height:3px;background:#2563eb;margin-right:6px;vertical-align:middle;"></span>规划路径</div>',
+    showRoadNetwork
+      ? '<div><span style="display:inline-block;width:18px;height:3px;background:#64748b;margin-right:6px;vertical-align:middle;"></span>路网参考线</div>'
+      : '',
+  ]
+    .filter(Boolean)
+    .join('');
+};
+
+const MapComponent: React.FC<MapComponentProps> = ({
+  center = [39.9042, 116.4074],
+  zoom = 15,
+  markers = [],
+  activeMarkerId = null,
+  onMarkerSelect,
+  path = [],
+  routeLegs = [],
+  congestionSegments = [],
+  activeRouteLegId = null,
+  focusPoints = [],
+  roadNetwork,
+  showRoadNetwork = false,
+  baseMapMode = 'street',
+  scenicAreaName,
+  routeSource,
+  showDirectionArrows = true,
+  pathLegendItems = [],
+}) => {
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<HTMLDivElement>(null);
+  const mapInstance = useRef<L.Map | null>(null);
+  const tileLayerRef = useRef<L.TileLayer | null>(null);
+  const legendRef = useRef<HTMLDivElement | null>(null);
+  const lastViewportKeyRef = useRef('');
+  const lastRenderKeyRef = useRef('');
+
+  const nodeMap = useMemo(() => {
+    const result = new Map<string, RoadNetworkNode>();
+    for (const node of roadNetwork?.nodes || []) {
+      result.set(node.id, node);
+    }
+    return result;
+  }, [roadNetwork]);
+
+  useEffect(() => {
+    if (!mapRef.current || mapInstance.current) return;
+
+    const map = L.map(mapRef.current, {
+      zoomControl: true,
+      attributionControl: true,
+      zoomAnimation: false,
+      fadeAnimation: false,
+      markerZoomAnimation: false,
+      inertia: false,
+    }).setView(center, zoom);
+    mapInstance.current = map;
+
+    const tileLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: 'Leaflet | OpenStreetMap contributors',
+      opacity: 1,
+    }).addTo(map);
+    tileLayerRef.current = tileLayer;
+
+    const LegendControl = L.Control.extend({
+      onAdd() {
+        const div = L.DomUtil.create('div', 'map-legend');
+        div.style.background = 'rgba(255,255,255,0.95)';
+        div.style.borderRadius = '14px';
+        div.style.padding = '10px 12px';
+        div.style.boxShadow = '0 10px 24px rgba(0,0,0,0.12)';
+        div.style.fontSize = '12px';
+        div.style.lineHeight = '1.7';
+        legendRef.current = div;
+        return div;
+      },
+    });
+
+    new LegendControl({ position: 'bottomright' }).addTo(map);
+
+    return () => {
+      map.remove();
+      mapInstance.current = null;
+      tileLayerRef.current = null;
+      legendRef.current = null;
+    };
+  }, [center, zoom]);
+
+  useEffect(() => {
+    if (!legendRef.current) return;
+    legendRef.current.innerHTML = renderLegendHtml(markers, showRoadNetwork, pathLegendItems);
+  }, [markers, pathLegendItems, showRoadNetwork]);
+
+  useEffect(() => {
+    const map = mapInstance.current;
+    const tileLayer = tileLayerRef.current;
+    if (!map || !tileLayer) return;
+
+    tileLayer.setOpacity(1);
+
+    if (wrapperRef.current) {
+      wrapperRef.current.style.background =
+        baseMapMode === 'street'
+          ? '#f8fafc'
+          : 'radial-gradient(circle at top right, rgba(37,99,235,0.1), transparent 35%), radial-gradient(circle at bottom left, rgba(13,148,136,0.1), transparent 30%), linear-gradient(180deg, #f8fbff 0%, #eef5ff 100%)';
+    }
+  }, [baseMapMode]);
+
+  useEffect(() => {
+    const map = mapInstance.current;
+    if (!map) return;
+
+    const renderKey = JSON.stringify({
+      markers,
+      path,
+      routeLegs,
+      congestionSegments,
+      activeRouteLegId,
+      focusPoints,
+      showRoadNetwork,
+      baseMapMode,
+      routeSource,
+    });
+
+    if (lastRenderKeyRef.current === renderKey) {
+      return;
+    }
+    lastRenderKeyRef.current = renderKey;
+
+    const removable: L.Layer[] = [];
+    map.eachLayer((layer) => {
+      if (layer instanceof L.Marker || layer instanceof L.Polyline || layer instanceof L.CircleMarker) {
+        removable.push(layer);
+      }
+    });
+    removable.forEach((layer) => map.removeLayer(layer));
+
+    const routeViewportPoints = [
+      ...(focusPoints.length ? focusPoints : []),
+      ...path,
+      ...routeLegs.flatMap((leg) => leg.points),
+      ...congestionSegments.flatMap((segment) => segment.points),
+    ];
+
+    const routeBounds = buildBounds(routeViewportPoints);
+    const viewportMarkerPoints = routeBounds
+      ? markers
+          .map((marker) => marker.position)
+          .filter((point) => isInBounds(point, expandBounds(routeBounds, VIEWPORT_PADDING)))
+      : markers.map((marker) => marker.position);
+    const viewportPoints = [...routeViewportPoints, ...viewportMarkerPoints];
+
+    if (showRoadNetwork && roadNetwork) {
+      const renderBounds = buildBounds(viewportPoints);
+      let renderedCount = 0;
+
+      for (const edge of roadNetwork.edges) {
+        if (renderedCount >= EDGE_RENDER_LIMIT) break;
+
+        const fromNode = nodeMap.get(edge.from);
+        const toNode = nodeMap.get(edge.to);
+        if (!fromNode || !toNode) continue;
+
+        if (
+          renderBounds &&
+          !(
+            isInBounds([fromNode.location.latitude, fromNode.location.longitude], expandBounds(renderBounds, 0.001)) ||
+            isInBounds([toNode.location.latitude, toNode.location.longitude], expandBounds(renderBounds, 0.001))
+          )
+        ) {
+          continue;
+        }
+
+        const style = ROAD_TYPE_STYLE[edge.roadType] || ROAD_TYPE_STYLE.side_road;
+        L.polyline(
+          [
+            [fromNode.location.latitude, fromNode.location.longitude],
+            [toNode.location.latitude, toNode.location.longitude],
+          ],
+          {
+            color: style.color,
+            weight: style.weight,
+            opacity: style.opacity,
+            dashArray: style.dashArray,
+            lineCap: 'round',
+          },
+        ).addTo(map);
+
+        renderedCount += 1;
+      }
+    }
+
+    const visibleRouteLegs = routeLegs.length
+      ? routeLegs.filter((leg) => !activeRouteLegId || leg.id === activeRouteLegId)
+      : [];
+
+    if (congestionSegments.length) {
+      const orderedSegments = [...congestionSegments].sort((left, right) => {
+        const leftPriority = left.isActive ? 1 : 0;
+        const rightPriority = right.isActive ? 1 : 0;
+        return leftPriority - rightPriority;
+      });
+
+      orderedSegments.forEach((segment) => {
+        if (segment.points.length < 2) return;
+        const polyline = L.polyline(segment.points, {
+          color: segment.color,
+          weight: segment.weight ?? (segment.isActive ? 7 : 2.5),
+          opacity: segment.opacity ?? (segment.isActive ? 0.98 : 0.16),
+          dashArray: segment.dashArray,
+          lineCap: 'round',
+          lineJoin: 'round',
+        }).addTo(map);
+        if (segment.title) {
+          polyline.bindTooltip(segment.title, {
+            sticky: true,
+            direction: 'top',
+          });
+        }
+      });
+    } else if (visibleRouteLegs.length) {
+      visibleRouteLegs.forEach((leg) => {
+        if (leg.points.length < 2) return;
+        L.polyline(leg.points, {
+          color: leg.color || (routeSource === 'osrm' ? '#2563eb' : '#4338ca'),
+          weight: 6,
+          opacity: 0.96,
+          lineCap: 'round',
+          lineJoin: 'round',
+          dashArray: leg.dashArray,
+        }).addTo(map);
+      });
+    } else if (path.length > 1) {
+      L.polyline(path, {
+        color: routeSource === 'osrm' ? '#2563eb' : '#4338ca',
+        weight: 5,
+        opacity: 0.92,
+        lineCap: 'round',
+        lineJoin: 'round',
+      }).addTo(map);
+    }
+
+    if (showDirectionArrows) {
+      const arrowLines = congestionSegments.length
+        ? congestionSegments
+            .filter((segment) => segment.isActive !== false && !segment.isConnector)
+            .map((segment) => ({ points: segment.points, color: segment.color }))
+        : visibleRouteLegs.length
+        ? visibleRouteLegs.map((leg) => ({ points: leg.points, color: leg.color || '#2563eb' }))
+        : path.length > 1
+        ? [{ points: path, color: routeSource === 'osrm' ? '#2563eb' : '#4338ca' }]
+        : [];
+
+      arrowLines.forEach((line) => {
+        buildArrowPoints(line.points).forEach((arrow) => {
+          const arrowIcon = L.divIcon({
+            className: 'route-direction-arrow',
+            html: `
+              <div style="
+                width:16px;
+                height:16px;
+                display:flex;
+                align-items:center;
+                justify-content:center;
+                transform: rotate(${arrow.bearing}deg);
+                filter: drop-shadow(0 0 6px rgba(255,255,255,0.96));
+              ">
+                <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    d="M12 2 L18 12 H14 V22 H10 V12 H6 Z"
+                    fill="${line.color}"
+                    stroke="rgba(255,255,255,0.92)"
+                    stroke-width="1.4"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </div>
+            `,
+            iconSize: [16, 16],
+            iconAnchor: [8, 8],
+          });
+
+          L.marker(arrow.position, {
+            icon: arrowIcon,
+            interactive: false,
+            keyboard: false,
+            zIndexOffset: 220,
+          }).addTo(map);
+        });
+      });
+    }
+
+    const markerCountByPosition = new Map<string, number>();
+    for (const marker of markers) {
+      const style = MARKER_STYLE[marker.type || 'default'] || MARKER_STYLE.default;
+      const key = buildMarkerKey(marker.position);
+      const duplicateIndex = markerCountByPosition.get(key) || 0;
+      markerCountByPosition.set(key, duplicateIndex + 1);
+
+      const adjustedPosition: [number, number] = [
+        marker.position[0] + duplicateIndex * DUPLICATE_MARKER_OFFSET,
+        marker.position[1] + duplicateIndex * DUPLICATE_MARKER_OFFSET,
+      ];
+
+      const label = marker.label ?? style.text;
+      const isActiveMarker = activeMarkerId === marker.id;
+      const icon = L.divIcon({
+        className: 'custom-marker',
+        html: `
+          <div style="
+            background:${style.bg};
+            width:${isActiveMarker ? 36 : 30}px;
+            height:${isActiveMarker ? 36 : 30}px;
+            border-radius:50%;
+            border:${isActiveMarker ? 3 : 2}px solid ${style.border || '#fff'};
+            color:${style.border ? style.border : '#fff'};
+            font-size:${isActiveMarker ? 13 : 12}px;
+            font-weight:700;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            box-shadow:${isActiveMarker ? '0 0 0 5px rgba(37,99,235,0.18), 0 12px 28px rgba(15,23,42,0.28)' : style.ring || '0 6px 16px rgba(15,23,42,0.24)'};
+            transform:${isActiveMarker ? 'scale(1.05)' : 'scale(1)'};
+            transition:all 0.18s ease;
+          ">${label}</div>
+        `,
+        iconSize: [isActiveMarker ? 36 : 30, isActiveMarker ? 36 : 30],
+        iconAnchor: [isActiveMarker ? 18 : 15, isActiveMarker ? 18 : 15],
+      });
+
+      const markerLayer = L.marker(adjustedPosition, {
+        icon,
+        zIndexOffset: isActiveMarker ? 320 : 120,
+      })
+        .addTo(map)
+        .bindPopup(marker.title);
+
+      if (onMarkerSelect) {
+        markerLayer.on('click', () => onMarkerSelect(marker));
+      }
+    }
+
+    const allPoints = viewportPoints.map((point) => L.latLng(point[0], point[1]));
+    const viewportKey = allPoints.map((point) => `${point.lat.toFixed(5)}:${point.lng.toFixed(5)}`).join('|');
+
+    if (allPoints.length > 1) {
+      if (lastViewportKeyRef.current !== viewportKey) {
+        map.fitBounds(L.latLngBounds(allPoints), { padding: [32, 32] });
+        lastViewportKeyRef.current = viewportKey;
+      }
+    } else if (allPoints.length === 1) {
+      if (lastViewportKeyRef.current !== viewportKey) {
+        map.setView(allPoints[0], zoom);
+        lastViewportKeyRef.current = viewportKey;
+      }
+    } else {
+      const fallbackKey = `${center[0].toFixed(5)}:${center[1].toFixed(5)}:${zoom}`;
+      if (lastViewportKeyRef.current !== fallbackKey) {
+        map.setView(center, zoom);
+        lastViewportKeyRef.current = fallbackKey;
+      }
+    }
+  }, [
+    activeRouteLegId,
+    center,
+    congestionSegments,
+    focusPoints,
+    activeMarkerId,
+    markers,
+    nodeMap,
+    onMarkerSelect,
+    path,
+    roadNetwork,
+    routeLegs,
+    routeSource,
+    showDirectionArrows,
+    showRoadNetwork,
+    zoom,
+  ]);
+
+  return (
+    <div
+      ref={wrapperRef}
+      style={{
+        minHeight: 420,
+        borderRadius: 22,
+        overflow: 'hidden',
+        position: 'relative',
+        background: '#f8fafc',
+      }}
+    >
+      <div ref={mapRef} style={{ minHeight: 420 }} />
+      <div
+        style={{
+          position: 'absolute',
+          top: 14,
+          right: 14,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 8,
+          pointerEvents: 'none',
+        }}
+      >
+        {scenicAreaName ? (
+          <div
+            style={{
+              background: 'rgba(15,23,42,0.72)',
+              color: '#fff',
+              borderRadius: 999,
+              padding: '8px 12px',
+              fontSize: 12,
+              fontWeight: 700,
+            }}
+          >
+            {scenicAreaName}
+          </div>
+        ) : null}
+        {routeSource ? (
+          <div
+            style={{
+              background: routeSource === 'osrm' ? 'rgba(34,197,94,0.92)' : 'rgba(79,70,229,0.92)',
+              color: '#fff',
+              borderRadius: 999,
+              padding: '8px 12px',
+              fontSize: 12,
+              fontWeight: 700,
+            }}
+          >
+            {routeSource === 'osrm' ? '真实街道路由' : '景区路网路由'}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+};
+
+export default React.memo(MapComponent);
+

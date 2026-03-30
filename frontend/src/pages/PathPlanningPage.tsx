@@ -1,0 +1,1453 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { App as AntdApp, AutoComplete, Button, Card, Checkbox, Col, Empty, Radio, Row, Space, Spin, Switch, Tag, Typography } from 'antd';
+import { AimOutlined, PlusOutlined, ReloadOutlined, SwapOutlined } from '@ant-design/icons';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import MapComponent from '../components/MapComponent';
+import pathPlanningService, {
+  MultiPointPath,
+  MultiPointStrategy,
+  Path,
+  PathSegment,
+  PlanningProfile,
+  RoadNetworkEdge,
+  RoadNetworkNode,
+  RouteContext,
+} from '../services/pathPlanningService';
+import { resolveErrorMessage } from '../utils/errorMessage';
+import { haversineDistance } from '../utils/geoUtils';
+
+const { Title, Paragraph, Text } = Typography;
+
+type TransportType = 'walk' | 'bicycle' | 'electric_cart';
+
+interface SearchOption {
+  value: string;
+  label: string;
+  placeName: string;
+  placeType: string;
+  scenicAreaId?: string | null;
+  latitude?: number;
+  longitude?: number;
+}
+
+interface MultiPreview {
+  order: string[];
+  totalDistance: number;
+  totalTime: number;
+  paths: Path[];
+  strategy: MultiPointStrategy;
+  transportationModes: TransportType[];
+}
+
+interface RouteLeg {
+  id: string;
+  fromId: string;
+  toId: string;
+  fromName: string;
+  toName: string;
+  distance: number;
+  time: number;
+  color: string;
+  points: [number, number][];
+  isReturn: boolean;
+  isConnector?: boolean;
+}
+
+interface TransportPlanItem {
+  id?: string;
+  transportation: TransportType;
+  distance: number;
+  time: number;
+  isConnector?: boolean;
+  segmentCount: number;
+  startSegmentIndex: number;
+  endSegmentIndex: number;
+}
+
+const cardStyle: React.CSSProperties = {
+  borderRadius: 24,
+  boxShadow: '0 18px 40px rgba(15,23,42,0.08)',
+  border: '1px solid rgba(148,163,184,0.12)',
+};
+
+const routeLegPalette = ['#2563eb', '#0f766e', '#f59e0b', '#8b5cf6', '#ec4899', '#14b8a6'];
+const transportLabelMap: Record<TransportType, string> = { walk: '步行', bicycle: '骑行', electric_cart: '电瓶车' };
+const transportColorMap: Record<TransportType, string> = {
+  walk: '#16a34a',
+  bicycle: '#2563eb',
+  electric_cart: '#f59e0b',
+};
+const strategyLabelMap: Record<MultiPointStrategy, string> = { shortest_distance: '最短距离', shortest_time: '最短时间' };
+const roadTypeLabelMap: Record<string, string> = { main_road: '主干道', bicycle_path: '骑行道', electric_cart_route: '电瓶车道', footpath: '步行道', side_road: '支路' };
+roadTypeLabelMap.connector = '步行接驳';
+const placeTypeLabelMap: Record<string, string> = {
+  junction: '导航点',
+  attraction: '景点',
+  facility: '设施',
+  scenic_area: '景区',
+  poi: '地点',
+};
+
+const hasCoord = (lat?: number, lng?: number) => Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(Number(lat)) <= 90 && Math.abs(Number(lng)) <= 180;
+const pretty = (value?: string | null) => (value || '').trim() || '未命名地点';
+const formatDistance = (distance: number) => `${Number(distance || 0).toFixed(1)} 米`;
+const formatTime = (minutes: number) => `${Number(minutes || 0).toFixed(1)} 分钟`;
+
+const nodeToOption = (node: RoadNetworkNode): SearchOption => ({
+  value: node.id,
+  label: pretty(node.name),
+  placeName: pretty(node.name),
+  placeType: node.type,
+  scenicAreaId: node.scenicAreaId || null,
+  latitude: node.location.latitude,
+  longitude: node.location.longitude,
+});
+
+const searchToOption = (item: { id: string; name: string; type: string; scenicAreaId: string | null; latitude: number; longitude: number }): SearchOption => ({
+  value: item.id,
+  label: pretty(item.name),
+  placeName: pretty(item.name),
+  placeType: item.type,
+  scenicAreaId: item.scenicAreaId || null,
+  latitude: item.latitude,
+  longitude: item.longitude,
+});
+
+const findBestNamedOption = (options: SearchOption[], keyword: string) => {
+  const trimmed = keyword.trim();
+  if (!trimmed) return null;
+  return (
+    options.find((item) => item.placeName === trimmed) ||
+    options.find((item) => item.label === trimmed) ||
+    options.find((item) => item.placeName.includes(trimmed)) ||
+    options[0] ||
+    null
+  );
+};
+
+const pathPoints = (path: Path): [number, number][] =>
+  path.routeGeometry?.length
+    ? path.routeGeometry.map((point) => [point.latitude, point.longitude] as [number, number])
+    : (path.segments || []).flatMap((segment) =>
+        segment.pathPoints?.length
+          ? segment.pathPoints.map((point) => [point.latitude, point.longitude] as [number, number])
+          : [
+              [segment.fromLocation.latitude, segment.fromLocation.longitude] as [number, number],
+              [segment.toLocation.latitude, segment.toLocation.longitude] as [number, number],
+            ],
+      );
+
+const normalizeCongestionFactor = (factor?: number) => {
+  const raw = Number(factor || 1);
+  if (!Number.isFinite(raw) || raw <= 0) return 1;
+  return raw > 1 ? 1 / raw : raw;
+};
+
+const congestionMeta = (factor?: number) => {
+  const value = normalizeCongestionFactor(factor);
+  if (value >= 0.85) return { label: '畅通', color: '#16a34a', tagColor: 'green' as const };
+  if (value >= 0.6) return { label: '缓行', color: '#f59e0b', tagColor: 'gold' as const };
+  return { label: '拥挤', color: '#dc2626', tagColor: 'red' as const };
+};
+
+const summarizeTransportSequence = (segments: PathSegment[] | undefined, fallbackModes: TransportType[]) => {
+  const ordered = (segments || [])
+    .map((segment) => segment.transportation)
+    .filter((item): item is TransportType => Boolean(item));
+  const uniqueOrdered = ordered.filter((item, index) => ordered.indexOf(item) === index);
+  const modes = uniqueOrdered.length ? uniqueOrdered : fallbackModes;
+  const labels = modes.map((item) => transportLabelMap[item]);
+  return labels.length > 1 ? `建议方式：${labels.join(' → ')}` : `建议方式：${labels[0] || '步行'}`;
+};
+
+const buildTransportPlan = (segments: PathSegment[] | undefined, fallbackModes: TransportType[]) => {
+  const source = segments?.length
+    ? segments
+    : fallbackModes.map((mode) => ({
+        transportation: mode,
+        distance: 0,
+        time: 0,
+        isConnector: false,
+      } as Pick<PathSegment, 'transportation' | 'distance' | 'time'>));
+
+  const groups: TransportPlanItem[] = [];
+  source.forEach((segment, segmentIndex) => {
+    const transportation = (segment.transportation || fallbackModes[0] || 'walk') as TransportType;
+    const current = groups[groups.length - 1];
+    const segmentConnector = Boolean((segment as PathSegment).isConnector);
+    if (current && current.transportation === transportation && Boolean(current.isConnector) === segmentConnector) {
+      current.distance += Number(segment.distance || 0);
+      current.time += Number(segment.time || 0);
+      current.segmentCount += 1;
+      current.endSegmentIndex = segmentIndex;
+      return;
+    }
+    groups.push({
+      transportation,
+      distance: Number(segment.distance || 0),
+      time: Number(segment.time || 0),
+      isConnector: segmentConnector,
+      segmentCount: 1,
+      startSegmentIndex: segmentIndex,
+      endSegmentIndex: segmentIndex,
+    });
+  });
+  return groups;
+};
+
+const describeTransportPlan = (item: TransportPlanItem, index: number, total: number) => {
+  if (item.isConnector) {
+    if (index === 0) return '从起点步行接驳进入路网';
+    if (index === total - 1) return '从路网步行接驳到终点';
+    return '中途步行接驳换乘';
+  }
+
+  if (item.transportation === 'walk') {
+    return `沿主路线步行前进${item.segmentCount > 1 ? `，覆盖 ${item.segmentCount} 段道路` : ''}`;
+  }
+  if (item.transportation === 'bicycle') {
+    return `沿主路线骑行前进${item.segmentCount > 1 ? `，覆盖 ${item.segmentCount} 段道路` : ''}`;
+  }
+  return `沿主路线乘电瓶车前进${item.segmentCount > 1 ? `，覆盖 ${item.segmentCount} 段道路` : ''}`;
+};
+
+const collectActualTransportModes = (paths: Path[], fallbackModes: TransportType[]) => {
+  const ordered: TransportType[] = [];
+  paths.forEach((path) => {
+    const candidates = (path.transportationModes?.length
+      ? path.transportationModes
+      : path.segments?.map((segment) => segment.transportation).filter(Boolean)) as TransportType[] | undefined;
+    (candidates || []).forEach((mode) => {
+      if (mode && !ordered.includes(mode)) {
+        ordered.push(mode);
+      }
+    });
+  });
+  return ordered.length ? ordered : fallbackModes;
+};
+
+const PathPlanningPage: React.FC = () => {
+  const { message } = AntdApp.useApp();
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+
+  const scenicAreaId = searchParams.get('scenicAreaId') || '';
+  const scenicAreaName = searchParams.get('scenicName') || '';
+  const queryKeyword = searchParams.get('keyword') || '';
+  const queryStartName = searchParams.get('startName') || '';
+  const queryEndName = searchParams.get('endName') || '';
+  const startNodeIdFromQuery = searchParams.get('startNodeId') || '';
+  const endNodeIdFromQuery = searchParams.get('endNodeId') || '';
+  const queryTransportation = (searchParams.get('transportation') || '') as TransportType;
+  const queryStartLat = Number(searchParams.get('startLat') || '');
+  const queryStartLng = Number(searchParams.get('startLng') || '');
+  const queryEndLat = Number(searchParams.get('endLat') || '');
+  const queryEndLng = Number(searchParams.get('endLng') || '');
+
+  const [roadNetwork, setRoadNetwork] = useState<{ nodes: RoadNetworkNode[]; edges: RoadNetworkEdge[] }>({ nodes: [], edges: [] });
+  const [planningProfile, setPlanningProfile] = useState<PlanningProfile | null>(null);
+  const [loadingRoadNetwork, setLoadingRoadNetwork] = useState(true);
+  const [loadingRoute, setLoadingRoute] = useState(false);
+
+  const [startInput, setStartInput] = useState('');
+  const [endInput, setEndInput] = useState('');
+  const [targetInput, setTargetInput] = useState('');
+  const [startOptions, setStartOptions] = useState<SearchOption[]>([]);
+  const [endOptions, setEndOptions] = useState<SearchOption[]>([]);
+  const [targetOptions, setTargetOptions] = useState<SearchOption[]>([]);
+  const [selectedStart, setSelectedStart] = useState<SearchOption | null>(null);
+  const [selectedEnd, setSelectedEnd] = useState<SearchOption | null>(null);
+  const [selectedTargets, setSelectedTargets] = useState<SearchOption[]>([]);
+
+  const [searchingStart, setSearchingStart] = useState(false);
+  const [searchingEnd, setSearchingEnd] = useState(false);
+  const [searchingTarget, setSearchingTarget] = useState(false);
+
+  const [multiPointMode, setMultiPointMode] = useState(false);
+  const [returnToStart, setReturnToStart] = useState(false);
+  const [strategy, setStrategy] = useState<MultiPointStrategy>('shortest_time');
+  const [transportModes, setTransportModes] = useState<TransportType[]>(['walk']);
+  const [transportationPath, setTransportationPath] = useState<Path | null>(null);
+  const [multiPreview, setMultiPreview] = useState<MultiPreview | null>(null);
+  const [activeLegId, setActiveLegId] = useState<string | null>(null);
+  const [activeTransportPlanId, setActiveTransportPlanId] = useState<string | null>(null);
+  const [baseMapMode, setBaseMapMode] = useState<'street' | 'scenic'>('scenic');
+  const [showRoadNetwork, setShowRoadNetwork] = useState(false);
+
+  const startTimerRef = useRef<number | null>(null);
+  const endTimerRef = useRef<number | null>(null);
+  const targetTimerRef = useRef<number | null>(null);
+  const initSignatureRef = useRef<string>('');
+  const singleEndDraftRef = useRef<{ input: string; option: SearchOption | null }>({ input: '', option: null });
+  const multiTargetDraftRef = useRef<{ input: string; options: SearchOption[]; returnToStart: boolean }>({
+    input: '',
+    options: [],
+    returnToStart: false,
+  });
+
+  const localOptions = useMemo(() => roadNetwork.nodes.map(nodeToOption), [roadNetwork.nodes]);
+  const preferredLocalOptions = useMemo(
+    () => [
+      ...localOptions.filter((item) => item.placeType !== 'junction'),
+      ...localOptions.filter((item) => item.placeType === 'junction'),
+    ],
+    [localOptions],
+  );
+  const optionRegistry = useMemo(() => {
+    const map = new Map<string, SearchOption>();
+    [...localOptions, ...startOptions, ...endOptions, ...targetOptions, ...selectedTargets, ...(selectedStart ? [selectedStart] : []), ...(selectedEnd ? [selectedEnd] : [])].forEach((item) => map.set(item.value, item));
+    return map;
+  }, [endOptions, localOptions, selectedEnd, selectedStart, selectedTargets, startOptions, targetOptions]);
+
+  const mergeOptions = (current: SearchOption[], ...items: Array<SearchOption | null | undefined>) => {
+    const map = new Map(current.map((item) => [item.value, item] as const));
+    items.forEach((item) => {
+      if (item?.value) map.set(item.value, item);
+    });
+    return Array.from(map.values());
+  };
+
+  const routePaths = useMemo(() => (multiPreview ? multiPreview.paths : transportationPath ? [transportationPath] : []), [multiPreview, transportationPath]);
+  const hasStreetRoute = routePaths.some((item) => item.routeSource === 'osrm');
+  const routeContext: RouteContext | null = useMemo(
+    () => multiPreview?.paths.find((item) => item.routeContext)?.routeContext || transportationPath?.routeContext || null,
+    [multiPreview, transportationPath],
+  );
+  const activePlanningProfile = planningProfile || routeContext?.planningProfile || null;
+  const allowedTransportModes = useMemo(
+    () =>
+      activePlanningProfile?.allowedTransportations?.length
+        ? activePlanningProfile.allowedTransportations
+        : (['walk', 'bicycle', 'electric_cart'] as TransportType[]),
+    [activePlanningProfile],
+  );
+  const defaultTransportModes = useMemo(
+    () =>
+      activePlanningProfile?.defaultTransportations?.length
+        ? activePlanningProfile.defaultTransportations
+        : (['walk'] as TransportType[]),
+    [activePlanningProfile],
+  );
+  const planningProfileDescription =
+    activePlanningProfile?.description ||
+    '当前场景未识别为校园或景区，默认保留通用步行 / 骑行 / 电瓶车模式。';
+
+  useEffect(() => {
+    const loadRoadNetwork = async () => {
+      setLoadingRoadNetwork(true);
+      try {
+        const response = await pathPlanningService.getRoadNetwork(scenicAreaId || undefined);
+        setRoadNetwork({ nodes: response.data.nodes, edges: response.data.edges });
+        setPlanningProfile(response.data.planningProfile || null);
+      } catch (error) {
+        message.error(resolveErrorMessage(error, '加载路网失败，请稍后重试。'));
+      } finally {
+        setLoadingRoadNetwork(false);
+      }
+    };
+    void loadRoadNetwork();
+  }, [message, scenicAreaId]);
+
+  useEffect(() => {
+    if (!localOptions.length) return;
+    setStartOptions((current) => (current.length ? current : preferredLocalOptions.slice(0, 12)));
+    setEndOptions((current) => (current.length ? current : preferredLocalOptions.slice(0, 12)));
+    setTargetOptions((current) => (current.length ? current : preferredLocalOptions.slice(0, 12)));
+  }, [preferredLocalOptions]);
+
+  useEffect(() => {
+    if (queryTransportation) setTransportModes([queryTransportation]);
+  }, [queryTransportation]);
+
+  useEffect(() => {
+    setTransportModes((current) => {
+      const filtered = current.filter((mode) => allowedTransportModes.includes(mode));
+      if (filtered.length) {
+        return filtered;
+      }
+      return [...defaultTransportModes];
+    });
+  }, [allowedTransportModes, defaultTransportModes]);
+
+  useEffect(
+    () => () => {
+      [startTimerRef, endTimerRef, targetTimerRef].forEach((timerRef) => {
+        if (timerRef.current) window.clearTimeout(timerRef.current);
+      });
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!routePaths.length) return;
+    setBaseMapMode(hasStreetRoute ? 'street' : 'scenic');
+    if (!hasStreetRoute) setShowRoadNetwork(false);
+  }, [hasStreetRoute, routePaths.length]);
+
+  useEffect(() => {
+    setActiveLegId(null);
+    if (multiPointMode) {
+      singleEndDraftRef.current = {
+        input: endInput,
+        option: selectedEnd,
+      };
+      const nextMultiDraft = multiTargetDraftRef.current;
+      setSelectedEnd(null);
+      setEndInput('');
+      if (nextMultiDraft.options.length || nextMultiDraft.input || nextMultiDraft.returnToStart) {
+        setSelectedTargets(nextMultiDraft.options);
+        setTargetInput(nextMultiDraft.input);
+        setReturnToStart(nextMultiDraft.returnToStart);
+      }
+    } else {
+      const nextEndDraft = singleEndDraftRef.current;
+      if (nextEndDraft.input) {
+        setEndInput(nextEndDraft.input);
+      }
+      if (nextEndDraft.option) {
+        setSelectedEnd(nextEndDraft.option);
+        setEndOptions((current) => mergeOptions(current, nextEndDraft.option));
+      }
+      setSelectedTargets([]);
+      setTargetInput('');
+      setReturnToStart(false);
+    }
+  }, [multiPointMode]);
+
+  useEffect(() => {
+    if (multiPointMode) {
+      multiTargetDraftRef.current = {
+        input: targetInput,
+        options: selectedTargets,
+        returnToStart,
+      };
+    } else {
+      singleEndDraftRef.current = {
+        input: endInput,
+        option: selectedEnd,
+      };
+    }
+  }, [endInput, multiPointMode, returnToStart, selectedEnd, selectedTargets, targetInput]);
+
+  useEffect(() => {
+    const initialize = async () => {
+      const signature = JSON.stringify({
+        scenicAreaId,
+        queryStartName,
+        queryEndName,
+        queryKeyword,
+        startNodeIdFromQuery,
+        endNodeIdFromQuery,
+        queryStartLat: hasCoord(queryStartLat, queryStartLng) ? `${queryStartLat}:${queryStartLng}` : '',
+        queryEndLat: hasCoord(queryEndLat, queryEndLng) ? `${queryEndLat}:${queryEndLng}` : '',
+      });
+      if (initSignatureRef.current === signature) {
+        return;
+      }
+      initSignatureRef.current = signature;
+
+      const initialStart =
+        (startNodeIdFromQuery && (optionRegistry.get(startNodeIdFromQuery) || localOptions.find((item) => item.value === startNodeIdFromQuery))) ||
+        null;
+      if (initialStart) {
+        setSelectedStart(initialStart);
+        setStartInput(initialStart.placeName);
+        setStartOptions((current) => mergeOptions(current, initialStart));
+      } else if (hasCoord(queryStartLat, queryStartLng)) {
+        try {
+          const nearest = await pathPlanningService.findNearestNode(queryStartLat, queryStartLng, scenicAreaId || undefined);
+          const matched = optionRegistry.get(nearest.data.nodeId) || localOptions.find((item) => item.value === nearest.data.nodeId);
+          const finalOption: SearchOption =
+            matched || {
+              value: nearest.data.nodeId,
+              label: queryStartName || '当前位置',
+              placeName: queryStartName || '当前位置',
+              placeType: 'poi',
+              scenicAreaId,
+              latitude: queryStartLat,
+              longitude: queryStartLng,
+            };
+          setSelectedStart(finalOption);
+          setStartInput(finalOption.placeName);
+          setStartOptions((current) => mergeOptions(current, finalOption));
+        } catch {
+          setStartInput(queryStartName || '当前位置');
+        }
+      } else if (queryStartName) {
+        setStartInput(queryStartName);
+      }
+
+      if (endNodeIdFromQuery) {
+        const initialEnd = optionRegistry.get(endNodeIdFromQuery) || localOptions.find((item) => item.value === endNodeIdFromQuery) || null;
+        if (initialEnd) {
+          setSelectedEnd(initialEnd);
+          setEndInput(initialEnd.placeName);
+          setEndOptions((current) => mergeOptions(current, initialEnd));
+          return;
+        }
+      }
+
+      const initialEndName = queryEndName || queryKeyword;
+      if (!initialEndName && !hasCoord(queryEndLat, queryEndLng)) return;
+      setEndInput(initialEndName || '查询目的地');
+
+      if (hasCoord(queryEndLat, queryEndLng)) {
+        try {
+          const nearest = await pathPlanningService.findNearestNode(queryEndLat, queryEndLng, scenicAreaId || undefined);
+          const matched = optionRegistry.get(nearest.data.nodeId) || localOptions.find((item) => item.value === nearest.data.nodeId);
+          const finalOption: SearchOption =
+            matched || {
+              value: nearest.data.nodeId,
+              label: initialEndName || '查询目的地',
+              placeName: initialEndName || '查询目的地',
+              placeType: '设施',
+              scenicAreaId,
+              latitude: queryEndLat,
+              longitude: queryEndLng,
+            };
+          setSelectedEnd(finalOption);
+          setEndInput(finalOption.placeName);
+          setEndOptions((current) => mergeOptions(current, finalOption));
+          return;
+        } catch {
+          // ignore and fall through to name search
+        }
+      }
+
+      if (initialEndName) {
+        try {
+          const response = await pathPlanningService.searchNodesByName(initialEndName, 12, scenicAreaId || undefined);
+          const option = response.data.map(searchToOption)[0];
+          if (option) {
+            setSelectedEnd(option);
+            setEndInput(option.placeName);
+            setEndOptions((current) => mergeOptions(current, option));
+          }
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    if (loadingRoadNetwork) return;
+    void initialize();
+  }, [
+    endNodeIdFromQuery,
+    loadingRoadNetwork,
+    localOptions,
+    optionRegistry,
+    queryEndLat,
+    queryEndLng,
+    queryEndName,
+    queryKeyword,
+    queryStartLat,
+    queryStartLng,
+    queryStartName,
+    scenicAreaId,
+    startNodeIdFromQuery,
+  ]);
+
+  useEffect(() => {
+    const hydrateQuerySelections = async () => {
+      if (loadingRoadNetwork) {
+        return;
+      }
+
+      if (queryStartName) {
+        try {
+          const response = await pathPlanningService.searchNodesByName(queryStartName, 12, scenicAreaId || undefined);
+          const namedOption = findBestNamedOption(response.data.map(searchToOption), queryStartName);
+          if (namedOption) {
+            const displayOption: SearchOption = {
+              ...namedOption,
+              label: queryStartName,
+              placeName: queryStartName,
+              latitude: hasCoord(queryStartLat, queryStartLng) ? queryStartLat : namedOption.latitude,
+              longitude: hasCoord(queryStartLat, queryStartLng) ? queryStartLng : namedOption.longitude,
+            };
+            setSelectedStart(displayOption);
+            setStartInput(queryStartName);
+            setStartOptions((current) => mergeOptions(current, displayOption));
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      const targetEndName = queryEndName || queryKeyword;
+      if (targetEndName) {
+        try {
+          const response = await pathPlanningService.searchNodesByName(targetEndName, 12, scenicAreaId || undefined);
+          const namedOption = findBestNamedOption(response.data.map(searchToOption), targetEndName);
+          if (namedOption) {
+            const displayOption: SearchOption = {
+              ...namedOption,
+              label: targetEndName,
+              placeName: targetEndName,
+              latitude: hasCoord(queryEndLat, queryEndLng) ? queryEndLat : namedOption.latitude,
+              longitude: hasCoord(queryEndLat, queryEndLng) ? queryEndLng : namedOption.longitude,
+            };
+            setSelectedEnd(displayOption);
+            setEndInput(targetEndName);
+            setEndOptions((current) => mergeOptions(current, displayOption));
+          }
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    void hydrateQuerySelections();
+  }, [
+    loadingRoadNetwork,
+    queryEndLat,
+    queryEndLng,
+    queryEndName,
+    queryKeyword,
+    queryStartLat,
+    queryStartLng,
+    queryStartName,
+    scenicAreaId,
+  ]);
+
+  useEffect(() => {
+    setTransportationPath(null);
+    setMultiPreview(null);
+    setActiveLegId(null);
+    setActiveTransportPlanId(null);
+  }, [startInput, endInput, multiPointMode, selectedTargets, strategy, transportModes, returnToStart]);
+
+  const searchNodes = async (keyword: string, target: 'start' | 'end' | 'target') => {
+    if (target === 'start') setSearchingStart(true);
+    if (target === 'end') setSearchingEnd(true);
+    if (target === 'target') setSearchingTarget(true);
+    try {
+      const response = await pathPlanningService.searchNodesByName(keyword, 12, scenicAreaId || undefined);
+      const options = response.data.map(searchToOption);
+      const fallback = keyword.trim() ? [] : preferredLocalOptions.slice(0, 12);
+      if (target === 'start') setStartOptions(options.length ? options : fallback);
+      if (target === 'end') setEndOptions(options.length ? options : fallback);
+      if (target === 'target') setTargetOptions(options.length ? options : fallback);
+    } catch {
+      const fallback = preferredLocalOptions
+        .filter((item) => !keyword.trim() || item.placeName.toLowerCase().includes(keyword.trim().toLowerCase()))
+        .slice(0, 12);
+      if (target === 'start') setStartOptions(fallback);
+      if (target === 'end') setEndOptions(fallback);
+      if (target === 'target') setTargetOptions(fallback);
+    } finally {
+      if (target === 'start') setSearchingStart(false);
+      if (target === 'end') setSearchingEnd(false);
+      if (target === 'target') setSearchingTarget(false);
+    }
+  };
+
+  const debounceSearch = (keyword: string, target: 'start' | 'end' | 'target') => {
+    const timerRef = target === 'start' ? startTimerRef : target === 'end' ? endTimerRef : targetTimerRef;
+    if (timerRef.current) window.clearTimeout(timerRef.current);
+    timerRef.current = window.setTimeout(() => void searchNodes(keyword, target), 220);
+  };
+
+  const searchSelectOptions = (options: SearchOption[]) =>
+    options.map((item) => ({
+      value: item.value,
+      label: (
+        <Space direction="vertical" size={0}>
+          <Text strong>{item.placeName}</Text>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {placeTypeLabelMap[item.placeType] || item.placeType}
+          </Text>
+        </Space>
+      ),
+    }));
+
+  const resolveExactSelection = async (input: string, selected: SearchOption | null, currentOptions: SearchOption[]) => {
+    const trimmed = input.trim();
+    if (!trimmed) return null;
+    if (selected && (selected.value === trimmed || selected.placeName === trimmed)) return selected;
+
+    const localMatch = currentOptions.find((item) => item.placeName === trimmed || item.label === trimmed || item.value === trimmed);
+    if (localMatch) return localMatch;
+
+    const response = await pathPlanningService.searchNodesByName(trimmed, 12, scenicAreaId || undefined);
+    const candidates = response.data.map(searchToOption);
+    return candidates.find((item) => item.placeName === trimmed) || candidates.find((item) => item.placeName.includes(trimmed)) || candidates[0] || null;
+  };
+
+  const resolveNavigableNode = async (input: string, selected: SearchOption | null, currentOptions: SearchOption[]) => {
+    const option = await resolveExactSelection(input, selected, currentOptions);
+    if (!option) return null;
+    if (option.placeType === 'scenic_area') {
+      return { nodeId: option.value, option };
+    }
+    if (
+      option.placeType === 'junction' ||
+      option.placeType === 'facility' ||
+      option.placeType === 'attraction' ||
+      !hasCoord(option.latitude, option.longitude)
+    ) {
+      return { nodeId: option.value, option };
+    }
+
+    const scopedLocalOptions = localOptions.filter(
+      (item) =>
+        item.placeType === 'junction' &&
+        (!option.scenicAreaId || item.scenicAreaId === option.scenicAreaId),
+    );
+    if (scopedLocalOptions.length && hasCoord(option.latitude, option.longitude)) {
+      const nearestLocal = scopedLocalOptions
+        .map((item) => ({
+          option: item,
+          distance: haversineDistance(
+            Number(option.latitude),
+            Number(option.longitude),
+            Number(item.latitude || 0),
+            Number(item.longitude || 0),
+          ),
+        }))
+        .sort((left, right) => left.distance - right.distance)[0]?.option;
+
+      if (nearestLocal) {
+        return { nodeId: nearestLocal.value, option };
+      }
+    }
+
+    const nearest = await pathPlanningService.findNearestNode(Number(option.latitude), Number(option.longitude), scenicAreaId || undefined);
+    return { nodeId: nearest.data.nodeId, option };
+  };
+
+  const handleUseCurrentLocation = async () => {
+    if (!navigator.geolocation) {
+      message.warning('当前浏览器不支持定位。');
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      async (position) => {
+        try {
+          const response = await pathPlanningService.findNearestNode(position.coords.latitude, position.coords.longitude, scenicAreaId || undefined);
+          const matched = optionRegistry.get(response.data.nodeId) || localOptions.find((item) => item.value === response.data.nodeId);
+          const option: SearchOption =
+            matched || {
+              value: response.data.nodeId,
+              label: '当前位置附近导航点',
+              placeName: '当前位置附近导航点',
+              placeType: '导航点',
+              scenicAreaId,
+            };
+          setSelectedStart(option);
+          setStartInput(option.placeName);
+          setStartOptions((current) => mergeOptions(current, option));
+          message.success('已将当前位置设置为起点。');
+        } catch (error) {
+          message.error(resolveErrorMessage(error, '获取当前位置失败，请稍后重试。'));
+        }
+      },
+      () => message.warning('无法获取当前位置。'),
+      { timeout: 5000, maximumAge: 30000 },
+    );
+  };
+
+  const handleAddTarget = async () => {
+    const resolved = await resolveExactSelection(targetInput, null, targetOptions);
+    if (!resolved) {
+      message.warning('请先选择一个有效的途经点。');
+      return;
+    }
+    if (selectedTargets.some((item) => item.value === resolved.value)) {
+      message.warning('该途经点已经添加过了。');
+      return;
+    }
+    setSelectedTargets((current) => [...current, resolved]);
+    setTargetInput('');
+  };
+
+  const buildMultiPreview = async (
+    optimized: MultiPointPath,
+    transportations: TransportType[],
+    shouldReturnToStart: boolean,
+    startNodeId: string,
+  ): Promise<MultiPreview> => {
+    const order = [...optimized.order];
+    if (shouldReturnToStart && order[order.length - 1] !== startNodeId) {
+      order.push(startNodeId);
+    }
+
+    const paths: Path[] = [];
+    for (let index = 0; index < order.length - 1; index += 1) {
+      const response = await pathPlanningService.planAdvancedRoute(order[index], order[index + 1], strategy, transportations);
+      paths.push(response.data);
+    }
+
+    const actualTransportModes = collectActualTransportModes(paths, transportations);
+
+    return {
+      order,
+      totalDistance: paths.reduce((sum, item) => sum + Number(item.distance || 0), 0),
+      totalTime: paths.reduce((sum, item) => sum + Number(item.time || 0), 0),
+      paths,
+      strategy,
+      transportationModes: actualTransportModes,
+    };
+  };
+
+  const handleSubmit = async () => {
+    if (!startInput.trim()) {
+      message.warning('请选择起点。');
+      return;
+    }
+
+    const modes = (transportModes.length ? transportModes : ['walk']) as TransportType[];
+    setLoadingRoute(true);
+    setActiveLegId(null);
+
+    try {
+      const resolvedStart = await resolveNavigableNode(startInput, selectedStart, startOptions);
+      if (!resolvedStart) {
+        message.warning('起点无法识别，请从候选列表中重新选择。');
+        return;
+      }
+      setSelectedStart(resolvedStart.option);
+      setStartInput(resolvedStart.option.placeName);
+      setStartOptions((current) => mergeOptions(current, resolvedStart.option));
+
+      if (multiPointMode) {
+        if (!selectedTargets.length) {
+          message.warning('请至少添加一个途经点。');
+          return;
+        }
+        const resolvedTargets = await Promise.all(
+          selectedTargets.map(async (item) => {
+            const resolved = await resolveNavigableNode(item.placeName, item, targetOptions);
+            return resolved || { nodeId: item.value, option: item };
+          }),
+        );
+        const uniqueTargets = resolvedTargets.filter((item) => item.nodeId !== resolvedStart.nodeId);
+        if (!uniqueTargets.length) {
+          message.warning('请至少保留一个与起点不同的途经点。');
+          return;
+        }
+        setSelectedTargets(uniqueTargets.map((item) => item.option));
+        const optimized = await pathPlanningService.optimizeMultiPointPath(
+          [resolvedStart.nodeId, ...uniqueTargets.map((item) => item.nodeId)],
+          strategy,
+          modes,
+        );
+        const preview = await buildMultiPreview(optimized.data, modes, returnToStart, resolvedStart.nodeId);
+        setTransportationPath(null);
+        setMultiPreview(preview);
+      } else {
+        if (!endInput.trim()) {
+          message.warning('请选择终点。');
+          return;
+        }
+        const resolvedEnd = await resolveNavigableNode(endInput, selectedEnd, endOptions);
+        if (!resolvedEnd) {
+          message.warning('终点无法识别，请从候选列表中重新选择。');
+          return;
+        }
+        if (resolvedStart.nodeId === resolvedEnd.nodeId) {
+          message.warning('起点和终点不能相同。');
+          return;
+        }
+        setSelectedEnd(resolvedEnd.option);
+        setEndInput(resolvedEnd.option.placeName);
+        setEndOptions((current) => mergeOptions(current, resolvedEnd.option));
+        const response = await pathPlanningService.planAdvancedRoute(resolvedStart.nodeId, resolvedEnd.nodeId, strategy, modes);
+        setMultiPreview(null);
+        setTransportationPath(response.data);
+      }
+    } catch (error) {
+      message.error(resolveErrorMessage(error, '生成路径失败，请稍后重试。'));
+    } finally {
+      setLoadingRoute(false);
+    }
+  };
+
+  const routeLegs = useMemo<RouteLeg[]>(
+    () =>
+      routePaths.map((path, index) => {
+        const fromId = multiPreview?.order[index] || path.path?.[0] || `start-${index}`;
+        const toId = multiPreview?.order[index + 1] || path.path?.[path.path.length - 1] || `end-${index}`;
+        const isReturn = Boolean(
+          multiPreview &&
+            index === routePaths.length - 1 &&
+            multiPreview.order[index + 1] === multiPreview.order[0] &&
+            routePaths.length > 1,
+        );
+        return {
+          id: `leg-${index}`,
+          fromId,
+          toId,
+          fromName:
+            !multiPreview && index === 0
+              ? selectedStart?.placeName || optionRegistry.get(fromId)?.placeName || pretty(fromId)
+              : optionRegistry.get(fromId)?.placeName || pretty(fromId),
+          toName:
+            !multiPreview && index === routePaths.length - 1
+              ? selectedEnd?.placeName || optionRegistry.get(toId)?.placeName || pretty(toId)
+              : optionRegistry.get(toId)?.placeName || pretty(toId),
+          distance: Number(path.distance || 0),
+          time: Number(path.time || 0),
+          color: isReturn ? '#7c3aed' : routeLegPalette[index % routeLegPalette.length],
+          points: pathPoints(path),
+          isReturn,
+          isConnector: Boolean(path.segments?.every((segment) => segment.isConnector)),
+        };
+      }),
+    [multiPreview, optionRegistry, routePaths, selectedEnd?.placeName, selectedStart?.placeName],
+  );
+
+  const routeLegTransportPlans = useMemo(
+    () =>
+      routePaths.map((path, index) => {
+        const fallbackModes =
+          ((path.transportationModes?.length
+            ? path.transportationModes
+            : path.segments?.map((segment) => segment.transportation).filter(Boolean)) as TransportType[] | undefined) ||
+          transportModes;
+
+        return buildTransportPlan(path.segments, fallbackModes).map((item, planIndex) => ({
+          ...item,
+          id: `leg-${index}-plan-${planIndex}`,
+        }));
+      }),
+    [routePaths, transportModes],
+  );
+
+  const congestionSegments = useMemo(
+    () =>
+      routePaths.flatMap((path, pathIndex) =>
+        (() => {
+          const activeSegments = path.segments || [];
+          const planGroups = routeLegTransportPlans[pathIndex] || [];
+          const transportationSet = Array.from(
+            new Set(activeSegments.map((segment) => segment.transportation).filter(Boolean)),
+          );
+          const useTransportColors = transportationSet.length > 1;
+          return activeSegments.map((segment: PathSegment, segmentIndex) => {
+            const transportPlanId =
+              planGroups.find(
+                (group) => segmentIndex >= group.startSegmentIndex && segmentIndex <= group.endSegmentIndex,
+              )?.id || null;
+            const isActive = activeTransportPlanId
+              ? transportPlanId === activeTransportPlanId
+              : !activeLegId || activeLegId === `leg-${pathIndex}`;
+
+            return ({
+            transportPlanId,
+            id: `leg-${pathIndex}-segment-${segmentIndex}`,
+            points: segment.pathPoints?.length
+              ? segment.pathPoints.map((point) => [point.latitude, point.longitude] as [number, number])
+              : [
+                  [segment.fromLocation.latitude, segment.fromLocation.longitude] as [number, number],
+                  [segment.toLocation.latitude, segment.toLocation.longitude] as [number, number],
+                ],
+            color: segment.isConnector
+              ? '#f59e0b'
+              : useTransportColors && segment.transportation
+                ? transportColorMap[segment.transportation]
+                : congestionMeta(segment.congestionFactor).color,
+            isActive,
+            title: `${segment.isConnector ? '步行接驳' : transportLabelMap[(segment.transportation || 'walk') as TransportType]} · ${
+              segment.roadName || roadTypeLabelMap[segment.roadType] || '道路'
+            }`,
+            dashArray: segment.isConnector ? '6,8' : undefined,
+            opacity: activeTransportPlanId ? (isActive ? (segment.isConnector ? 0.92 : 0.98) : 0.16) : segment.isConnector ? 0.75 : undefined,
+            weight: activeTransportPlanId ? (isActive ? (segment.isConnector ? 5 : 7) : 2) : segment.isConnector ? 3 : undefined,
+            isConnector: Boolean(segment.isConnector),
+          });
+        });
+      })(),
+      ),
+    [activeLegId, activeTransportPlanId, routeLegTransportPlans, routePaths],
+  );
+
+  const mapLegendItems = useMemo(() => {
+    const items: Array<{ id: string; label: string; color: string; dashArray?: string }> = [];
+    const seen = new Set<string>();
+
+    routePaths.forEach((path) => {
+      (path.segments || []).forEach((segment) => {
+        const key = segment.isConnector ? 'connector' : segment.transportation || 'walk';
+        if (seen.has(key)) return;
+        seen.add(key);
+
+        if (segment.isConnector) {
+          items.push({ id: key, label: '步行接驳', color: '#f59e0b', dashArray: '6,8' });
+          return;
+        }
+
+        const transportation = (segment.transportation || 'walk') as TransportType;
+        items.push({
+          id: key,
+          label: `${transportLabelMap[transportation]}路线`,
+          color: transportColorMap[transportation],
+        });
+      });
+    });
+
+    return items;
+  }, [routePaths]);
+
+  const mapMarkers = useMemo(() => {
+    if (!routeLegs.length) return [] as Array<{ id: string; position: [number, number]; title: string; type?: string; label?: string }>;
+    const markers: Array<{ id: string; position: [number, number]; title: string; type?: string; label?: string }> = [];
+    const firstLeg = routePaths[0];
+    const firstStartPoint =
+      firstLeg?.segments?.[0]?.fromLocation
+        ? [firstLeg.segments[0].fromLocation.latitude, firstLeg.segments[0].fromLocation.longitude] as [number, number]
+        : routeLegs[0].points[0];
+    if (firstStartPoint) {
+      markers.push({ id: 'start', position: firstStartPoint, title: `导航起点：${routeLegs[0].fromName}`, type: 'start', label: '起' });
+    }
+    routeLegs.forEach((leg, index) => {
+      const sourcePath = routePaths[index];
+      const lastSegment = sourcePath?.segments?.[sourcePath.segments.length - 1];
+      const point =
+        lastSegment?.toLocation
+          ? [lastSegment.toLocation.latitude, lastSegment.toLocation.longitude] as [number, number]
+          : leg.points[leg.points.length - 1];
+      if (!point) return;
+      const isLast = index === routeLegs.length - 1;
+      markers.push({
+        id: `marker-${leg.id}`,
+        position: point,
+        title: leg.isReturn ? `返回起点：${leg.toName}` : isLast ? `导航终点：${leg.toName}` : `途经点 ${index + 1}：${leg.toName}`,
+        type: leg.isReturn ? 'return' : isLast ? 'end' : 'waypoint',
+        label: leg.isReturn ? '返' : isLast ? '终' : String(index + 1),
+      });
+    });
+
+    return markers;
+  }, [routeLegs, routePaths]);
+
+  const mapCenter = useMemo<[number, number]>(() => {
+    const center = routeContext?.center;
+    if (center) return [center.latitude, center.longitude];
+    if (routeLegs[0]?.points[0]) return routeLegs[0].points[0];
+    const firstNode = roadNetwork.nodes[0];
+    if (firstNode) return [firstNode.location.latitude, firstNode.location.longitude];
+    return [39.9042, 116.4074];
+  }, [roadNetwork.nodes, routeContext?.center, routeLegs]);
+
+  const activeLeg = routeLegs.find((item) => item.id === activeLegId) || routeLegs[0] || null;
+  const activePathIndex = activeLeg ? routeLegs.findIndex((item) => item.id === activeLeg.id) : 0;
+  const activeTransportPlan =
+    activePathIndex >= 0
+      ? routeLegTransportPlans[activePathIndex]?.find((item) => item.id === activeTransportPlanId) || null
+      : null;
+  const mapRouteLegs = useMemo(
+    () => routeLegs.map((leg) => ({ id: leg.id, points: leg.points, color: leg.color, title: leg.id })),
+    [routeLegs],
+  );
+  const mapFocusPoints = useMemo(() => {
+    if (!activeTransportPlan || activePathIndex < 0) {
+      return activeLeg?.points || [];
+    }
+
+    const activePath = routePaths[activePathIndex];
+    const segments = activePath?.segments?.slice(
+      activeTransportPlan.startSegmentIndex,
+      activeTransportPlan.endSegmentIndex + 1,
+    );
+
+    return (segments || []).flatMap((segment) =>
+      segment.pathPoints?.length
+        ? segment.pathPoints.map((point) => [point.latitude, point.longitude] as [number, number])
+        : [
+            [segment.fromLocation.latitude, segment.fromLocation.longitude] as [number, number],
+            [segment.toLocation.latitude, segment.toLocation.longitude] as [number, number],
+          ],
+    );
+  }, [activeLeg, activePathIndex, activeTransportPlan, routePaths]);
+  const noResultContent = <Text type="secondary">当前范围内暂无匹配地点</Text>;
+
+  return (
+    <div style={{ padding: '28px 24px 40px' }}>
+      <Space direction="vertical" size={24} style={{ width: '100%' }}>
+        <div>
+          <Title level={2} style={{ marginBottom: 8 }}>户外路径规划</Title>
+          <Paragraph type="secondary" style={{ marginBottom: 0 }}>
+            回到更稳定的按名称选点体验，同时保留多目标点、最短时间 / 最短距离和混合交通工具功能。
+          </Paragraph>
+        </div>
+
+        <Card style={cardStyle} bodyStyle={{ padding: 24 }}>
+          <Row gutter={[20, 20]}>
+            <Col xs={24} lg={11}>
+              <Text strong>起点</Text>
+              <AutoComplete
+                style={{ width: '100%', marginTop: 8 }}
+                value={startInput}
+                options={searchSelectOptions(startOptions)}
+                onChange={(value) => {
+                  const nextValue = String(value);
+                  setStartInput(nextValue);
+                  if (selectedStart && nextValue !== selectedStart.placeName) {
+                    setSelectedStart(null);
+                  }
+                }}
+                onSearch={(value) => {
+                  setStartInput(value);
+                  debounceSearch(value, 'start');
+                }}
+                onSelect={(value) => {
+                  const option = optionRegistry.get(String(value));
+                  if (!option) return;
+                  setSelectedStart(option);
+                  setStartInput(option.placeName);
+                }}
+                onBlur={() => {
+                  if (selectedStart && startInput === selectedStart.placeName) return;
+                  setSelectedStart(null);
+                }}
+                placeholder="按名称搜索起点"
+                filterOption={false}
+                notFoundContent={searchingStart ? <Spin size="small" /> : noResultContent}
+                size="large"
+              />
+              <Space wrap style={{ marginTop: 12 }}>
+                <Button icon={<AimOutlined />} onClick={() => void handleUseCurrentLocation()}>
+                  使用当前位置
+                </Button>
+                <Button
+                  icon={<SwapOutlined />}
+                  onClick={() => {
+                    const previousStart = startInput;
+                    const previousEnd = endInput;
+                    const previousStartOption = selectedStart;
+                    const previousEndOption = selectedEnd;
+                    setStartInput(previousEnd);
+                    setEndInput(previousStart);
+                    setSelectedStart(previousEndOption);
+                    setSelectedEnd(previousStartOption);
+                  }}
+                >
+                  交换起终点
+                </Button>
+              </Space>
+            </Col>
+            <Col xs={24} lg={13}>
+              {!multiPointMode ? (
+                <>
+                  <Text strong>终点</Text>
+                  <AutoComplete
+                    style={{ width: '100%', marginTop: 8 }}
+                    value={endInput}
+                    options={searchSelectOptions(endOptions)}
+                    onChange={(value) => {
+                      const nextValue = String(value);
+                      setEndInput(nextValue);
+                      if (selectedEnd && nextValue !== selectedEnd.placeName) {
+                        setSelectedEnd(null);
+                      }
+                    }}
+                    onSearch={(value) => {
+                      setEndInput(value);
+                      debounceSearch(value, 'end');
+                    }}
+                    onSelect={(value) => {
+                      const option = optionRegistry.get(String(value));
+                      if (!option) return;
+                      setSelectedEnd(option);
+                      setEndInput(option.placeName);
+                    }}
+                    onBlur={() => {
+                      if (selectedEnd && endInput === selectedEnd.placeName) return;
+                      setSelectedEnd(null);
+                    }}
+                    placeholder="按名称搜索终点"
+                    filterOption={false}
+                    notFoundContent={searchingEnd ? <Spin size="small" /> : noResultContent}
+                    size="large"
+                  />
+                </>
+              ) : (
+                <>
+                  <Text strong>途经点</Text>
+                  <AutoComplete
+                    style={{ width: '100%', marginTop: 8 }}
+                    value={targetInput}
+                    options={searchSelectOptions(targetOptions)}
+                    onChange={(value) => setTargetInput(String(value))}
+                    onSearch={(value) => {
+                      setTargetInput(value);
+                      debounceSearch(value, 'target');
+                    }}
+                    onSelect={(value) => {
+                      const option = optionRegistry.get(String(value));
+                      if (!option) return;
+                      setTargetInput(option.placeName);
+                    }}
+                    placeholder="添加途经点"
+                    filterOption={false}
+                    notFoundContent={searchingTarget ? <Spin size="small" /> : noResultContent}
+                    size="large"
+                  />
+                  <Space wrap style={{ marginTop: 12 }}>
+                    <Button icon={<PlusOutlined />} onClick={() => void handleAddTarget()}>
+                      添加途经点
+                    </Button>
+                    <Space align="center">
+                      <Switch checked={returnToStart} onChange={setReturnToStart} />
+                      <Text>参观后返回起点</Text>
+                    </Space>
+                  </Space>
+                  <Space wrap style={{ marginTop: 12 }}>
+                    {selectedTargets.map((item, index) => (
+                      <Tag
+                        key={item.value}
+                        closable
+                        color="blue"
+                        onClose={(event) => {
+                          event.preventDefault();
+                          setSelectedTargets((current) => current.filter((target) => target.value !== item.value));
+                        }}
+                      >
+                        第 {index + 1} 站：{item.placeName}
+                      </Tag>
+                    ))}
+                  </Space>
+                </>
+              )}
+            </Col>
+          </Row>
+          <Row gutter={[20, 20]} style={{ marginTop: 20 }}>
+            <Col xs={24} lg={10}>
+              <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                <Text strong>规划模式</Text>
+                <Radio.Group value={multiPointMode ? 'multi' : 'single'} onChange={(event) => setMultiPointMode(event.target.value === 'multi')}>
+                  <Radio.Button value="single">单终点</Radio.Button>
+                  <Radio.Button value="multi">多目标点</Radio.Button>
+                </Radio.Group>
+              </Space>
+            </Col>
+            <Col xs={24} lg={7}>
+              <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                <Text strong>规划策略</Text>
+                <Radio.Group value={strategy} onChange={(event) => setStrategy(event.target.value)}>
+                  <Radio.Button value="shortest_time">最短时间</Radio.Button>
+                  <Radio.Button value="shortest_distance">最短距离</Radio.Button>
+                </Radio.Group>
+              </Space>
+            </Col>
+            <Col xs={24} lg={7}>
+              <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                <Text strong>交通工具</Text>
+                <Space wrap>
+                  <Tag color={activePlanningProfile?.kind === 'campus' ? 'blue' : activePlanningProfile?.kind === 'scenic' ? 'green' : 'default'}>
+                    场景：{activePlanningProfile?.label || '通用'}
+                  </Tag>
+                  {activePlanningProfile?.vehicleTransportation ? (
+                    <Tag color="purple">主交通：{transportLabelMap[activePlanningProfile.vehicleTransportation as TransportType]}</Tag>
+                  ) : null}
+                </Space>
+                <Checkbox.Group
+                  options={allowedTransportModes.map((value) => ({ value, label: transportLabelMap[value] }))}
+                  value={transportModes}
+                  onChange={(values) => {
+                    const nextModes = (values as TransportType[]).filter(Boolean);
+                    setTransportModes(nextModes.length ? nextModes : [...defaultTransportModes]);
+                  }}
+                />
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  {planningProfileDescription}
+                </Text>
+              </Space>
+            </Col>
+          </Row>
+          <Text type="secondary" style={{ display: 'block', marginTop: 16 }}>
+            当前只展示当前景区或校园范围内的候选地点。多目标点模式下，先添加途经点，再生成最优路线；开启“返回起点”后会自动补齐闭环路径。
+          </Text>
+          <Space style={{ marginTop: 24 }} wrap>
+            <Button type="primary" onClick={() => void handleSubmit()} loading={loadingRoute} size="large">
+              开始规划
+            </Button>
+            <Button
+              size="large"
+              icon={<ReloadOutlined />}
+              onClick={() => {
+                setStartInput('');
+                setEndInput('');
+                setTargetInput('');
+                setSelectedStart(null);
+                setSelectedEnd(null);
+                setSelectedTargets([]);
+                setTransportationPath(null);
+                setMultiPreview(null);
+                setActiveLegId(null);
+                setTransportModes([...defaultTransportModes]);
+              }}
+            >
+              重置
+            </Button>
+            <Button size="large" onClick={() => navigate('/query')}>
+              返回查询页
+            </Button>
+          </Space>
+        </Card>
+
+        <Card style={cardStyle} bodyStyle={{ padding: 24 }}>
+          <Row gutter={[24, 24]}>
+            <Col xs={24} lg={11}>
+              <Space direction="vertical" size={18} style={{ width: '100%' }}>
+                <div>
+                  <Title level={3} style={{ marginBottom: 8 }}>路径结果</Title>
+                  <Text type="secondary">当前范围：{scenicAreaName || routeContext?.scenicAreaName || '当前地图范围'}</Text>
+                </div>
+                {loadingRoadNetwork ? <Spin tip="正在加载路网..." /> : null}
+                {loadingRoute ? <Spin tip="正在生成路径..." /> : null}
+                {!loadingRoute && !routeLegs.length ? <Empty description="请选择地点并开始规划。" /> : null}
+                {routeLegs.length ? (
+                  <>
+                    <Space wrap>
+                      <Tag color="blue">策略：{strategyLabelMap[multiPreview?.strategy || transportationPath?.strategy || strategy]}</Tag>
+                      <Tag color={activePlanningProfile?.kind === 'campus' ? 'blue' : activePlanningProfile?.kind === 'scenic' ? 'green' : 'default'}>
+                        场景：{activePlanningProfile?.label || '通用'}
+                      </Tag>
+                      <Tag color="purple">
+                        交通工具：
+                        {(multiPreview?.transportationModes || transportationPath?.transportationModes || transportModes)
+                          .map((item) => transportLabelMap[item])
+                          .join(' / ')}
+                      </Tag>
+                      <Tag color="green">路径来源：{hasStreetRoute ? '真实街道' : '景区路网'}</Tag>
+                      {(multiPreview?.transportationModes || transportationPath?.transportationModes || transportModes).length > 1 ? (
+                        <Tag color="magenta">混合交通</Tag>
+                      ) : null}
+                      {multiPointMode ? <Tag color="cyan">多目标点</Tag> : <Tag color="default">单终点</Tag>}
+                      {multiPointMode && returnToStart ? <Tag color="purple">返回起点</Tag> : null}
+                    </Space>
+                    <Card variant="borderless" style={{ borderRadius: 20, background: '#f8fafc' }}>
+                      <Space direction="vertical" size={14} style={{ width: '100%' }}>
+                        <Text strong>
+                          总计：{formatDistance(multiPreview?.totalDistance || Number(transportationPath?.distance || 0))} / {formatTime(multiPreview?.totalTime || Number(transportationPath?.time || 0))}
+                        </Text>
+                        {routeLegs.map((leg, index) => {
+                          const meta = congestionMeta(routePaths[index]?.segments?.[0]?.congestionFactor);
+                          const legModes =
+                            (routePaths[index]?.segments
+                              ?.map((segment) => segment.transportation)
+                              .filter((item): item is TransportType => Boolean(item))
+                              .filter((item, itemIndex, source) => source.indexOf(item) === itemIndex)) || [];
+                          const transportPlan = routeLegTransportPlans[index] || [];
+                          return (
+                            <Card
+                              key={leg.id}
+                              hoverable
+                              variant="borderless"
+                              onClick={() => {
+                                setActiveLegId(leg.id);
+                                setActiveTransportPlanId(null);
+                              }}
+                              style={{
+                                borderRadius: 18,
+                                cursor: 'pointer',
+                                border: activeLegId === leg.id || (!activeLegId && index === 0) ? `2px solid ${leg.color}` : '1px solid rgba(148,163,184,0.18)',
+                                boxShadow: 'none',
+                              }}
+                            >
+                              <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                                <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                                  <Text strong>第 {index + 1} 段：{leg.fromName} {'->'} {leg.toName}</Text>
+                                  <Text>{formatDistance(leg.distance)} / {formatTime(leg.time)}</Text>
+                                </Space>
+                                <Space wrap>
+                                  {leg.isReturn ? <Tag color="purple">回程</Tag> : null}
+                                  <Tag color={meta.tagColor}>{meta.label}</Tag>
+                                  <Tag color="geekblue">{summarizeTransportSequence(routePaths[index]?.segments, legModes.length ? legModes : transportModes)}</Tag>
+                                </Space>
+                                {transportPlan.length > 1 ? (
+                                  <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                                    {transportPlan.map((item, planIndex) => (
+                                      <div
+                                        key={item.id || `${leg.id}-plan-${planIndex}`}
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          setActiveLegId(leg.id);
+                                          setActiveTransportPlanId(activeTransportPlanId === item.id ? null : item.id || null);
+                                        }}
+                                        style={{
+                                          width: '100%',
+                                          padding: '12px 14px',
+                                          borderRadius: 14,
+                                          cursor: 'pointer',
+                                          border:
+                                            activeTransportPlanId === item.id
+                                              ? '1px solid rgba(37,99,235,0.55)'
+                                              : '1px solid rgba(148,163,184,0.18)',
+                                          background:
+                                            activeTransportPlanId === item.id
+                                              ? 'rgba(37,99,235,0.08)'
+                                              : 'rgba(255,255,255,0.82)',
+                                          boxShadow:
+                                            activeTransportPlanId === item.id ? '0 10px 24px rgba(37,99,235,0.12)' : 'none',
+                                          transition: 'all 0.18s ease',
+                                        }}
+                                      >
+                                        <Space wrap size={[8, 8]}>
+                                          <Tag color={item.isConnector ? 'gold' : item.transportation === 'walk' ? 'green' : item.transportation === 'bicycle' ? 'blue' : 'orange'}>
+                                            第 {planIndex + 1} 段：{item.isConnector ? '步行接驳' : transportLabelMap[item.transportation]}
+                                          </Tag>
+                                          <Tag color={activeTransportPlanId === item.id ? 'geekblue' : 'default'}>
+                                            {activeTransportPlanId === item.id ? '已选中' : '点击聚焦'}
+                                          </Tag>
+                                          <Text type="secondary">
+                                            {formatDistance(item.distance)} / {formatTime(item.time)}
+                                          </Text>
+                                        </Space>
+                                        <Text type="secondary">{describeTransportPlan(item, planIndex, transportPlan.length)}</Text>
+                                      </div>
+                                    ))}
+                                  </Space>
+                                ) : null}
+                              </Space>
+                            </Card>
+                          );
+                        })}
+                      </Space>
+                    </Card>
+                  </>
+                ) : null}
+              </Space>
+            </Col>
+            <Col xs={24} lg={13}>
+              <Space direction="vertical" size={16} style={{ width: '100%' }}>
+                <Space style={{ justifyContent: 'space-between', width: '100%' }} wrap>
+                  <Space>
+                    <Button type={baseMapMode === 'scenic' ? 'primary' : 'default'} onClick={() => setBaseMapMode('scenic')}>景区导航图</Button>
+                    <Button type={baseMapMode === 'street' ? 'primary' : 'default'} disabled={!hasStreetRoute} onClick={() => setBaseMapMode('street')}>真实街道图</Button>
+                  </Space>
+                  <Space>
+                    <Text>显示路网参考线</Text>
+                    <Switch checked={showRoadNetwork} onChange={setShowRoadNetwork} disabled={hasStreetRoute} />
+                  </Space>
+                </Space>
+                <Card variant="borderless" style={{ borderRadius: 24, background: '#f8fafc' }} bodyStyle={{ padding: 12 }}>
+                  <MapComponent
+                    center={mapCenter}
+                    zoom={16}
+                    markers={mapMarkers}
+                    routeLegs={mapRouteLegs}
+                    congestionSegments={congestionSegments}
+                    activeRouteLegId={activeLegId || routeLegs[0]?.id || null}
+                    focusPoints={mapFocusPoints}
+                    roadNetwork={roadNetwork}
+                    showRoadNetwork={!hasStreetRoute && showRoadNetwork}
+                    baseMapMode={baseMapMode}
+                    scenicAreaName={scenicAreaName || routeContext?.scenicAreaName || null}
+                    routeSource={(hasStreetRoute ? 'osrm' : 'graph') as 'graph' | 'osrm'}
+                    showDirectionArrows
+                    pathLegendItems={mapLegendItems}
+                  />
+                </Card>
+              </Space>
+            </Col>
+          </Row>
+        </Card>
+      </Space>
+    </div>
+  );
+};
+
+export default PathPlanningPage;

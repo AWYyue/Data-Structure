@@ -1,0 +1,131 @@
+import api from './api';
+
+export interface ScenicArea {
+  id: string;
+  name: string;
+  category: string;
+  description?: string;
+  coverImageUrl?: string;
+  cityLabel?: string;
+  coverImageTheme?: string;
+  latitude?: number;
+  longitude?: number;
+  rating: number;
+  visitorCount: number;
+  tags?: string[];
+  averageRating?: number;
+  popularity?: number;
+  reviewCount?: number;
+  ticketPrice?: number;
+}
+
+export interface Facility {
+  id: string;
+  name: string;
+  category: string;
+  latitude?: number;
+  longitude?: number;
+  description?: string;
+  distanceKm?: number;
+  distanceSource?: 'road_network' | 'haversine';
+  scenicAreaId?: string;
+}
+
+export interface Attraction {
+  id: string;
+  name: string;
+  category: string;
+  description?: string;
+  latitude?: number;
+  longitude?: number;
+  rating?: number;
+  type?: string;
+  cuisine?: string;
+  scenicAreaId?: string;
+}
+
+export interface SearchResult {
+  scenicAreas: ScenicArea[];
+  attractions: Attraction[];
+  facilities: Facility[];
+}
+
+export interface ScenicAreaDetails {
+  scenicArea: ScenicArea;
+  attractions: Attraction[];
+  facilities: Facility[];
+}
+
+export interface ImportResult {
+  scenicAreas: number;
+  attractions: number;
+  facilities: number;
+}
+
+export interface QueryService {
+  getScenicAreaDetails: (id: string) => Promise<{ success: boolean; data: ScenicAreaDetails }>;
+  searchScenicAreas: (query: string, limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
+  searchFacilities: (params: {
+    type?: string;
+    scenicAreaId?: string;
+    limit?: number;
+    latitude?: number;
+    longitude?: number;
+    radiusKm?: number;
+  }) => Promise<{ success: boolean; data: Facility[] }>;
+  searchFood: (query: string, limit?: number) => Promise<{ success: boolean; data: Attraction[] }>;
+  search: (query: string, limit?: number) => Promise<{ success: boolean; data: SearchResult }>;
+  searchScenicAreasByCategory: (category: string, limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
+  searchScenicAreasByTag: (tag: string, limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
+  exportScenicAreaData: () => Promise<Blob>;
+  importScenicAreaData: (payload: unknown) => Promise<{ success: boolean; data: ImportResult }>;
+}
+
+const queryService: QueryService = {
+  getScenicAreaDetails: async (id) => {
+    return api.get(`/query/scenic-area/${id}`);
+  },
+
+  searchScenicAreas: async (query, limit = 10) => {
+    return api.get(`/query/scenic-areas?query=${encodeURIComponent(query)}&limit=${limit}`);
+  },
+
+  searchFacilities: async ({ type, scenicAreaId, limit = 10, latitude, longitude, radiusKm }) => {
+    let url = `/query/facilities?limit=${limit}`;
+    if (type) url += `&type=${encodeURIComponent(type)}`;
+    if (scenicAreaId) url += `&scenicAreaId=${encodeURIComponent(scenicAreaId)}`;
+    if (typeof latitude === 'number' && typeof longitude === 'number') {
+      url += `&latitude=${latitude}&longitude=${longitude}`;
+    }
+    if (typeof radiusKm === 'number' && Number.isFinite(radiusKm) && radiusKm > 0) {
+      url += `&radiusKm=${radiusKm}`;
+    }
+    return api.get(url);
+  },
+
+  searchFood: async (query, limit = 10) => {
+    return api.get(`/query/food?query=${encodeURIComponent(query)}&limit=${limit}`);
+  },
+
+  search: async (query, limit = 15) => {
+    return api.get(`/query/search?query=${encodeURIComponent(query)}&limit=${limit}`);
+  },
+
+  searchScenicAreasByCategory: async (category, limit = 10) => {
+    return api.get(`/query/scenic-areas-by-category?category=${encodeURIComponent(category)}&limit=${limit}`);
+  },
+
+  searchScenicAreasByTag: async (tag, limit = 10) => {
+    return api.get(`/query/scenic-areas-by-tag?tag=${encodeURIComponent(tag)}&limit=${limit}`);
+  },
+
+  exportScenicAreaData: async () => {
+    return api.get('/query/export-data', { responseType: 'blob' });
+  },
+
+  importScenicAreaData: async (payload) => {
+    return api.post('/query/import-data', payload);
+  },
+};
+
+export default queryService;
