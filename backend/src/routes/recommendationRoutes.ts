@@ -5,6 +5,62 @@ import { authMiddleware } from '../middleware/auth';
 const router = express.Router();
 const recommendationService = new RecommendationService();
 
+router.get('/cities', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit as string) || 12;
+    const cities = await recommendationService.getCityDestinationOptions(limit);
+    res.status(200).json({
+      success: true,
+      data: cities,
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'RECOMMENDATION_FAILED',
+        message: error.message,
+      },
+    });
+  }
+});
+
+router.post('/city-itinerary', authMiddleware, async (req, res) => {
+  try {
+    const userId = (req as any).user.userId;
+    const { cityLabel, theme, tripDays } = req.body || {};
+
+    if (!cityLabel || typeof cityLabel !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'MISSING_PARAMS',
+          message: 'cityLabel is required',
+        },
+      });
+    }
+
+    const itinerary = await recommendationService.generateCityTravelItinerary(
+      userId,
+      cityLabel.trim(),
+      theme || 'comprehensive',
+      Number(tripDays || 1),
+    );
+
+    res.status(200).json({
+      success: true,
+      data: itinerary,
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'RECOMMENDATION_FAILED',
+        message: error.message,
+      },
+    });
+  }
+});
+
 // 热度榜
 router.get('/ranking/popularity', async (req, res) => {
   try {

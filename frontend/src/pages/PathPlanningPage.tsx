@@ -53,6 +53,16 @@ interface RouteLeg {
   isConnector?: boolean;
 }
 
+interface CityDayRoutePayloadStop {
+  id?: string;
+  scenicAreaId?: string | null;
+  name: string;
+  latitude: number;
+  longitude: number;
+  day?: number;
+  order?: number;
+}
+
 interface TransportPlanItem {
   id?: string;
   transportation: TransportType;
@@ -123,6 +133,33 @@ const findBestNamedOption = (options: SearchOption[], keyword: string) => {
     options[0] ||
     null
   );
+};
+
+const parseCityDayRoutePayload = (raw: string): CityDayRoutePayloadStop[] => {
+  if (!raw.trim()) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed
+      .map((item) => ({
+        id: typeof item?.id === 'string' ? item.id : '',
+        scenicAreaId: typeof item?.scenicAreaId === 'string' ? item.scenicAreaId : null,
+        name: String(item?.name || '').trim(),
+        latitude: Number(item?.latitude),
+        longitude: Number(item?.longitude),
+        day: Number(item?.day || 0),
+        order: Number(item?.order || 0),
+      }))
+      .filter((item) => item.name && hasCoord(item.latitude, item.longitude));
+  } catch {
+    return [];
+  }
 };
 
 const pathPoints = (path: Path): [number, number][] =>
@@ -239,10 +276,22 @@ const PathPlanningPage: React.FC = () => {
   const startNodeIdFromQuery = searchParams.get('startNodeId') || '';
   const endNodeIdFromQuery = searchParams.get('endNodeId') || '';
   const queryTransportation = (searchParams.get('transportation') || '') as TransportType;
+  const queryMode = searchParams.get('mode') || '';
+  const queryStrategy = (searchParams.get('strategy') || '') as MultiPointStrategy | '';
+  const queryTransportations = (searchParams.get('transportations') || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item): item is TransportType => ['walk', 'bicycle', 'electric_cart'].includes(item));
+  const querySource = searchParams.get('source') || '';
+  const autoPlanFromQuery = searchParams.get('autoPlan') === '1';
+  const dayLabelFromQuery = searchParams.get('dayLabel') || '';
+  const cityLabelFromQuery = searchParams.get('cityLabel') || '';
+  const dayRoutePayloadFromQuery = parseCityDayRoutePayload(searchParams.get('dayRoutePayload') || '');
   const queryStartLat = Number(searchParams.get('startLat') || '');
   const queryStartLng = Number(searchParams.get('startLng') || '');
   const queryEndLat = Number(searchParams.get('endLat') || '');
   const queryEndLng = Number(searchParams.get('endLng') || '');
+  const isCityItineraryNavigation = querySource === 'city-itinerary' && dayRoutePayloadFromQuery.length > 0;
 
   const [roadNetwork, setRoadNetwork] = useState<{ nodes: RoadNetworkNode[]; edges: RoadNetworkEdge[] }>({ nodes: [], edges: [] });
   const [planningProfile, setPlanningProfile] = useState<PlanningProfile | null>(null);
@@ -278,6 +327,8 @@ const PathPlanningPage: React.FC = () => {
   const endTimerRef = useRef<number | null>(null);
   const targetTimerRef = useRef<number | null>(null);
   const initSignatureRef = useRef<string>('');
+  const dayRouteInitSignatureRef = useRef<string>('');
+  const autoPlanTriggeredRef = useRef(false);
   const singleEndDraftRef = useRef<{ input: string; option: SearchOption | null }>({ input: '', option: null });
   const multiTargetDraftRef = useRef<{ input: string; options: SearchOption[]; returnToStart: boolean }>({
     input: '',
@@ -332,6 +383,10 @@ const PathPlanningPage: React.FC = () => {
     activePlanningProfile?.description ||
     '当前场景未识别为校园或景区，默认保留通用步行 / 骑行 / 电瓶车模式。';
 
+  const cityDaySourceHint = dayRoutePayloadFromQuery.length
+    ? `${cityLabelFromQuery || '城市行程'} · ${dayLabelFromQuery || '当日路线'}`
+    : '';
+
   useEffect(() => {
     const loadRoadNetwork = async () => {
       setLoadingRoadNetwork(true);
@@ -356,8 +411,73 @@ const PathPlanningPage: React.FC = () => {
   }, [preferredLocalOptions]);
 
   useEffect(() => {
-    if (queryTransportation) setTransportModes([queryTransportation]);
-  }, [queryTransportation]);
+    if (queryTransportations.length) {
+      setTransportModes(queryTransportations);
+      return;
+    }
+
+    if (queryTransportation) {
+      setTransportModes([queryTransportation]);
+    }
+  }, [queryTransportation, queryTransportations]);
+
+  useEffect(() => {
+    if (queryStrategy === 'shortest_distance' || queryStrategy === 'shortest_time') {
+      setStrategy(queryStrategy);
+    }
+  }, [queryStrategy]);
+
+  useEffect(() => {
+    if (loadingRoadNetwork || !dayRoutePayloadFromQuery.length) {
+      return;
+    }
+
+    const initializeCityDayRoute = async () => {
+      const signature = JSON.stringify(dayRoutePayloadFromQuery);
+      if (dayRouteInitSignatureRef.current === signature) {
+        return;
+      }
+      dayRouteInitSignatureRef.current = signature;
+      autoPlanTriggeredRef.current = false;
+
+      const toOption = (stop: CityDayRoutePayloadStop, index: number): SearchOption => ({
+        value: stop.id || `city-day-${stop.scenicAreaId || 'poi'}-${stop.day || 0}-${stop.order || index + 1}`,
+        label: stop.name,
+        placeName: stop.name,
+        placeType: 'poi',
+        scenicAreaId: stop.scenicAreaId || null,
+        latitude: stop.latitude,
+        longitude: stop.longitude,
+      });
+
+      const stopSelections = dayRoutePayloadFromQuery.map((stop, index) => toOption(stop, index));
+
+      setMultiPointMode(queryMode === 'multi' || stopSelections.length > 1);
+      setReturnToStart(false);
+      setSelectedEnd(null);
+      setEndInput('');
+      setSelectedTargets(stopSelections);
+      setTargetInput('');
+      setTargetOptions((current) => mergeOptions(current, ...stopSelections));
+
+      if (isCityItineraryNavigation) {
+        const currentLocation = await getCurrentLocationOption();
+        if (currentLocation) {
+          setSelectedStart(currentLocation);
+          setStartInput(currentLocation.placeName);
+          setStartOptions((current) => mergeOptions(current, currentLocation, ...stopSelections));
+          return;
+        }
+      }
+
+      const fallbackStart = stopSelections[0];
+      setSelectedStart(fallbackStart);
+      setStartInput(fallbackStart.placeName);
+      setStartOptions((current) => mergeOptions(current, fallbackStart, ...stopSelections));
+    };
+
+    void initializeCityDayRoute();
+  }, [dayRoutePayloadFromQuery, isCityItineraryNavigation, loadingRoadNetwork, queryMode]);
 
   useEffect(() => {
     setTransportModes((current) => {
@@ -716,35 +836,63 @@ const PathPlanningPage: React.FC = () => {
     return { nodeId: nearest.data.nodeId, option };
   };
 
-  const handleUseCurrentLocation = async () => {
+  const getCurrentLocationOption = async (): Promise<SearchOption | null> => {
     if (!navigator.geolocation) {
       message.warning('当前浏览器不支持定位。');
-      return;
+      return null;
     }
-    navigator.geolocation.getCurrentPosition(
-      async (position) => {
-        try {
-          const response = await pathPlanningService.findNearestNode(position.coords.latitude, position.coords.longitude, scenicAreaId || undefined);
-          const matched = optionRegistry.get(response.data.nodeId) || localOptions.find((item) => item.value === response.data.nodeId);
-          const option: SearchOption =
-            matched || {
-              value: response.data.nodeId,
-              label: '当前位置附近导航点',
-              placeName: '当前位置附近导航点',
-              placeType: '导航点',
-              scenicAreaId,
-            };
-          setSelectedStart(option);
-          setStartInput(option.placeName);
-          setStartOptions((current) => mergeOptions(current, option));
-          message.success('已将当前位置设置为起点。');
-        } catch (error) {
-          message.error(resolveErrorMessage(error, '获取当前位置失败，请稍后重试。'));
-        }
-      },
-      () => message.warning('无法获取当前位置。'),
-      { timeout: 5000, maximumAge: 30000 },
-    );
+
+    return new Promise((resolve) => {
+      navigator.geolocation.getCurrentPosition(
+        async (position) => {
+          try {
+            const response = await pathPlanningService.findNearestNode(
+              position.coords.latitude,
+              position.coords.longitude,
+              scenicAreaId || undefined,
+            );
+            const matched =
+              optionRegistry.get(response.data.nodeId) || localOptions.find((item) => item.value === response.data.nodeId);
+            const option: SearchOption = matched
+              ? {
+                  ...matched,
+                  label: '当前位置',
+                  placeName: '当前位置',
+                  placeType: 'poi',
+                  latitude: position.coords.latitude,
+                  longitude: position.coords.longitude,
+                }
+              : {
+                  value: response.data.nodeId,
+                  label: '当前位置',
+                  placeName: '当前位置',
+                  placeType: 'poi',
+                  scenicAreaId,
+                  latitude: position.coords.latitude,
+                  longitude: position.coords.longitude,
+                };
+            resolve(option);
+          } catch (error) {
+            message.error(resolveErrorMessage(error, '获取当前位置失败，请稍后重试。'));
+            resolve(null);
+          }
+        },
+        () => {
+          message.warning('无法获取当前位置。');
+          resolve(null);
+        },
+        { timeout: 5000, maximumAge: 30000 },
+      );
+    });
+  };
+
+  const handleUseCurrentLocation = async () => {
+    const option = await getCurrentLocationOption();
+    if (!option) return;
+    setSelectedStart(option);
+    setStartInput(option.placeName);
+    setStartOptions((current) => mergeOptions(current, option));
+    message.success('已将当前位置设置为起点。');
   };
 
   const handleAddTarget = async () => {
@@ -790,6 +938,33 @@ const PathPlanningPage: React.FC = () => {
     };
   };
 
+  const buildSequentialPreview = async (
+    orderedStops: Array<{ nodeId: string; option: SearchOption }>,
+    transportations: TransportType[],
+  ): Promise<MultiPreview> => {
+    const paths: Path[] = [];
+    for (let index = 0; index < orderedStops.length - 1; index += 1) {
+      const response = await pathPlanningService.planAdvancedRoute(
+        orderedStops[index].nodeId,
+        orderedStops[index + 1].nodeId,
+        strategy,
+        transportations,
+      );
+      paths.push(response.data);
+    }
+
+    const actualTransportModes = collectActualTransportModes(paths, transportations);
+
+    return {
+      order: orderedStops.map((item) => item.option.value),
+      totalDistance: paths.reduce((sum, item) => sum + Number(item.distance || 0), 0),
+      totalTime: paths.reduce((sum, item) => sum + Number(item.time || 0), 0),
+      paths,
+      strategy,
+      transportationModes: actualTransportModes,
+    };
+  };
+
   const handleSubmit = async () => {
     if (!startInput.trim()) {
       message.warning('请选择起点。');
@@ -827,12 +1002,19 @@ const PathPlanningPage: React.FC = () => {
           return;
         }
         setSelectedTargets(uniqueTargets.map((item) => item.option));
-        const optimized = await pathPlanningService.optimizeMultiPointPath(
-          [resolvedStart.nodeId, ...uniqueTargets.map((item) => item.nodeId)],
-          strategy,
-          modes,
-        );
-        const preview = await buildMultiPreview(optimized.data, modes, returnToStart, resolvedStart.nodeId);
+        const preview = isCityItineraryNavigation
+          ? await buildSequentialPreview(
+              [{ nodeId: resolvedStart.nodeId, option: resolvedStart.option }, ...uniqueTargets],
+              modes,
+            )
+          : await (async () => {
+              const optimized = await pathPlanningService.optimizeMultiPointPath(
+                [resolvedStart.nodeId, ...uniqueTargets.map((item) => item.nodeId)],
+                strategy,
+                modes,
+              );
+              return buildMultiPreview(optimized.data, modes, returnToStart, resolvedStart.nodeId);
+            })();
         setTransportationPath(null);
         setMultiPreview(preview);
       } else {
@@ -862,6 +1044,42 @@ const PathPlanningPage: React.FC = () => {
       setLoadingRoute(false);
     }
   };
+
+  useEffect(() => {
+    if (!autoPlanFromQuery || !dayRoutePayloadFromQuery.length) {
+      return;
+    }
+
+    if (loadingRoadNetwork || loadingRoute || transportationPath || multiPreview) {
+      return;
+    }
+
+    const expectedTargetCount = isCityItineraryNavigation
+      ? dayRoutePayloadFromQuery.length
+      : Math.max(dayRoutePayloadFromQuery.length - 1, 0);
+
+    if (!multiPointMode || !selectedStart || selectedTargets.length !== expectedTargetCount) {
+      return;
+    }
+
+    if (autoPlanTriggeredRef.current) {
+      return;
+    }
+
+    autoPlanTriggeredRef.current = true;
+    void handleSubmit();
+  }, [
+    autoPlanFromQuery,
+    dayRoutePayloadFromQuery,
+    isCityItineraryNavigation,
+    loadingRoadNetwork,
+    loadingRoute,
+    multiPreview,
+    multiPointMode,
+    selectedStart,
+    selectedTargets,
+    transportationPath,
+  ]);
 
   const routeLegs = useMemo<RouteLeg[]>(
     () =>
@@ -1071,6 +1289,25 @@ const PathPlanningPage: React.FC = () => {
             回到更稳定的按名称选点体验，同时保留多目标点、最短时间 / 最短距离和混合交通工具功能。
           </Paragraph>
         </div>
+
+        {cityDaySourceHint ? (
+          <Card
+            variant="borderless"
+            style={{
+              ...cardStyle,
+              background: 'linear-gradient(135deg, rgba(37,99,235,0.08), rgba(16,185,129,0.05))',
+            }}
+            bodyStyle={{ padding: 18 }}
+          >
+            <Space wrap style={{ width: '100%', justifyContent: 'space-between' }}>
+              <Space wrap>
+                <Tag color="blue">城市日程接力</Tag>
+                <Text strong>{cityDaySourceHint}</Text>
+              </Space>
+              <Text type="secondary">已按这一天的景点顺序自动切入多目标详细导航。</Text>
+            </Space>
+          </Card>
+        ) : null}
 
         <Card style={cardStyle} bodyStyle={{ padding: 24 }}>
           <Row gutter={[20, 20]}>

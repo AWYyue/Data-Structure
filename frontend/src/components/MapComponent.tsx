@@ -8,8 +8,23 @@ interface MapMarker {
   id: string;
   position: [number, number];
   title: string;
+  disablePopup?: boolean;
   type?: string;
   label?: string;
+  imageUrl?: string;
+  badgeLabel?: string;
+  tooltipHtml?: string;
+  tooltipPermanent?: boolean;
+  tooltipDirection?: 'top' | 'right' | 'bottom' | 'left' | 'center' | 'auto';
+  tooltipOffset?: [number, number];
+  backgroundColor?: string;
+  borderColor?: string;
+  textColor?: string;
+  size?: number;
+  opacity?: number;
+  zIndexOffset?: number;
+  dimmed?: boolean;
+  shadowColor?: string;
 }
 
 interface RouteLeg {
@@ -42,6 +57,8 @@ interface PathLegendItem {
 interface MapComponentProps {
   center?: [number, number];
   zoom?: number;
+  focusZoom?: number;
+  preferFocusPoints?: boolean;
   markers?: MapMarker[];
   activeMarkerId?: string | null;
   onMarkerSelect?: (marker: {
@@ -90,8 +107,133 @@ const MARKER_STYLE: Record<string, { bg: string; border?: string; text: string; 
 const EDGE_RENDER_LIMIT = 2200;
 const DUPLICATE_MARKER_OFFSET = 0.00012;
 const VIEWPORT_PADDING = 0.0035;
+const DEFAULT_TOOLTIP_SIZE = { width: 200, height: 92 };
+const COMPACT_TOOLTIP_SIZE = { width: 148, height: 54 };
+
+type TooltipPlacement = {
+  direction: 'top' | 'right' | 'bottom' | 'left' | 'center' | 'auto';
+  offset: [number, number];
+};
+
+type TooltipRect = {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+};
+
+const TOOLTIP_PLACEMENT_CANDIDATES: TooltipPlacement[] = [
+  { direction: 'top', offset: [0, -98] },
+  { direction: 'right', offset: [138, -26] },
+  { direction: 'left', offset: [-138, -26] },
+  { direction: 'bottom', offset: [0, 76] },
+  { direction: 'right', offset: [146, 54] },
+  { direction: 'left', offset: [-146, 54] },
+  { direction: 'top', offset: [96, -104] },
+  { direction: 'top', offset: [-96, -104] },
+  { direction: 'right', offset: [168, -82] },
+  { direction: 'left', offset: [-168, -82] },
+];
 
 const buildMarkerKey = (position: [number, number]) => `${position[0].toFixed(6)}:${position[1].toFixed(6)}`;
+
+const isCompactTooltip = (tooltipHtml?: string) =>
+  typeof tooltipHtml === 'string' && tooltipHtml.includes('data-compact-tooltip="1"');
+
+const buildTooltipRect = (
+  anchorX: number,
+  anchorY: number,
+  placement: TooltipPlacement,
+  size: { width: number; height: number },
+): TooltipRect => {
+  if (placement.direction === 'right') {
+    const left = anchorX + placement.offset[0];
+    const top = anchorY + placement.offset[1] - size.height / 2;
+    return { left, top, right: left + size.width, bottom: top + size.height };
+  }
+
+  if (placement.direction === 'left') {
+    const right = anchorX + placement.offset[0];
+    const left = right - size.width;
+    const top = anchorY + placement.offset[1] - size.height / 2;
+    return { left, top, right, bottom: top + size.height };
+  }
+
+  if (placement.direction === 'bottom') {
+    const left = anchorX + placement.offset[0] - size.width / 2;
+    const top = anchorY + placement.offset[1];
+    return { left, top, right: left + size.width, bottom: top + size.height };
+  }
+
+  const left = anchorX + placement.offset[0] - size.width / 2;
+  const bottom = anchorY + placement.offset[1];
+  const top = bottom - size.height;
+  return { left, top, right: left + size.width, bottom };
+};
+
+const computeRectIntersectionArea = (left: TooltipRect, right: TooltipRect) => {
+  const overlapWidth = Math.max(0, Math.min(left.right, right.right) - Math.max(left.left, right.left));
+  const overlapHeight = Math.max(0, Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top));
+  return overlapWidth * overlapHeight;
+};
+
+const resolveTooltipPlacements = (
+  map: L.Map,
+  markers: Array<MapMarker & { adjustedPosition: [number, number]; duplicateIndex: number }>,
+  activeMarkerId: string | null,
+) => {
+  const markersWithPermanentTooltip = markers.filter((marker) => marker.tooltipHtml && marker.tooltipPermanent);
+  const placementMap = new Map<string, TooltipPlacement>();
+  if (!markersWithPermanentTooltip.length) {
+    return placementMap;
+  }
+
+  const viewportSize = map.getSize();
+  const occupiedRects: TooltipRect[] = [];
+  const orderedMarkers = [...markersWithPermanentTooltip].sort((left, right) => {
+    const leftPriority = left.id === activeMarkerId ? 3 : left.zIndexOffset ?? 0;
+    const rightPriority = right.id === activeMarkerId ? 3 : right.zIndexOffset ?? 0;
+    return rightPriority - leftPriority;
+  });
+
+  orderedMarkers.forEach((marker) => {
+    const anchorPoint = map.latLngToContainerPoint(marker.adjustedPosition);
+    const tooltipSize = isCompactTooltip(marker.tooltipHtml) ? COMPACT_TOOLTIP_SIZE : DEFAULT_TOOLTIP_SIZE;
+    let bestPlacement = TOOLTIP_PLACEMENT_CANDIDATES[0];
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (const placement of TOOLTIP_PLACEMENT_CANDIDATES) {
+      const rect = buildTooltipRect(anchorPoint.x, anchorPoint.y, placement, tooltipSize);
+      const overlapPenalty = occupiedRects.reduce(
+        (sum, occupiedRect) => sum + computeRectIntersectionArea(rect, occupiedRect),
+        0,
+      );
+      const viewportPenalty =
+        Math.max(0, -rect.left) +
+        Math.max(0, -rect.top) +
+        Math.max(0, rect.right - viewportSize.x) +
+        Math.max(0, rect.bottom - viewportSize.y);
+      const markerPenalty = computeRectIntersectionArea(rect, {
+        left: anchorPoint.x - 18,
+        top: anchorPoint.y - 18,
+        right: anchorPoint.x + 18,
+        bottom: anchorPoint.y + 18,
+      });
+      const directionPenalty = placement.direction === 'top' ? 0 : placement.direction === 'right' || placement.direction === 'left' ? 24 : 38;
+      const score = overlapPenalty * 10 + viewportPenalty * 6 + markerPenalty * 3 + directionPenalty;
+
+      if (score < bestScore) {
+        bestScore = score;
+        bestPlacement = placement;
+      }
+    }
+
+    placementMap.set(marker.id, bestPlacement);
+    occupiedRects.push(buildTooltipRect(anchorPoint.x, anchorPoint.y, bestPlacement, tooltipSize));
+  });
+
+  return placementMap;
+};
 
 const buildBounds = (points: [number, number][]) => {
   if (!points.length) return null;
@@ -226,6 +368,8 @@ const renderLegendHtml = (
 const MapComponent: React.FC<MapComponentProps> = ({
   center = [39.9042, 116.4074],
   zoom = 15,
+  focusZoom,
+  preferFocusPoints = false,
   markers = [],
   activeMarkerId = null,
   onMarkerSelect,
@@ -363,7 +507,28 @@ const MapComponent: React.FC<MapComponentProps> = ({
           .map((marker) => marker.position)
           .filter((point) => isInBounds(point, expandBounds(routeBounds, VIEWPORT_PADDING)))
       : markers.map((marker) => marker.position);
-    const viewportPoints = [...routeViewportPoints, ...viewportMarkerPoints];
+    const viewportPoints =
+      preferFocusPoints && focusPoints.length ? [...focusPoints] : [...routeViewportPoints, ...viewportMarkerPoints];
+    const allPoints = viewportPoints.map((point) => L.latLng(point[0], point[1]));
+    const viewportKey = allPoints.map((point) => `${point.lat.toFixed(5)}:${point.lng.toFixed(5)}`).join('|');
+
+    if (allPoints.length > 1) {
+      if (lastViewportKeyRef.current !== viewportKey) {
+        map.fitBounds(L.latLngBounds(allPoints), { padding: [32, 32] });
+        lastViewportKeyRef.current = viewportKey;
+      }
+    } else if (allPoints.length === 1) {
+      if (lastViewportKeyRef.current !== viewportKey) {
+        map.setView(allPoints[0], focusZoom ?? zoom);
+        lastViewportKeyRef.current = viewportKey;
+      }
+    } else {
+      const fallbackKey = `${center[0].toFixed(5)}:${center[1].toFixed(5)}:${zoom}`;
+      if (lastViewportKeyRef.current !== fallbackKey) {
+        map.setView(center, zoom);
+        lastViewportKeyRef.current = fallbackKey;
+      }
+    }
 
     if (showRoadNetwork && roadNetwork) {
       const renderBounds = buildBounds(viewportPoints);
@@ -506,8 +671,7 @@ const MapComponent: React.FC<MapComponentProps> = ({
     }
 
     const markerCountByPosition = new Map<string, number>();
-    for (const marker of markers) {
-      const style = MARKER_STYLE[marker.type || 'default'] || MARKER_STYLE.default;
+    const markerRenderEntries = markers.map((marker) => {
       const key = buildMarkerKey(marker.position);
       const duplicateIndex = markerCountByPosition.get(key) || 0;
       markerCountByPosition.set(key, duplicateIndex + 1);
@@ -516,65 +680,128 @@ const MapComponent: React.FC<MapComponentProps> = ({
         marker.position[0] + duplicateIndex * DUPLICATE_MARKER_OFFSET,
         marker.position[1] + duplicateIndex * DUPLICATE_MARKER_OFFSET,
       ];
+      return { ...marker, adjustedPosition, duplicateIndex };
+    });
+
+    const tooltipPlacementMap = resolveTooltipPlacements(map, markerRenderEntries, activeMarkerId);
+
+    for (const marker of markerRenderEntries) {
+      const style = MARKER_STYLE[marker.type || 'default'] || MARKER_STYLE.default;
 
       const label = marker.label ?? style.text;
       const isActiveMarker = activeMarkerId === marker.id;
-      const icon = L.divIcon({
-        className: 'custom-marker',
-        html: `
+      const markerSize = marker.size ?? (isActiveMarker ? 36 : 30);
+      const backgroundColor = marker.backgroundColor || style.bg;
+      const borderColor = marker.borderColor || style.border || '#fff';
+      const textColor = marker.textColor || (style.border ? style.border : '#fff');
+      const markerOpacity = marker.opacity ?? 1;
+      const isWideLabel = String(label || '').length > 1;
+      const markerWidth = isWideLabel ? Math.max(markerSize + 8, String(label).length * 10 + 14) : markerSize;
+      const markerHeight = markerSize;
+      const markerShadowColor = marker.shadowColor || backgroundColor;
+      const safeImageUrl = marker.imageUrl?.replace(/'/g, '&#39;');
+      const badgeLabel = marker.badgeLabel || label;
+      const shouldUseCoverMarker = Boolean(marker.imageUrl);
+
+      const iconHtml = shouldUseCoverMarker
+        ? `
           <div style="
-            background:${style.bg};
-            width:${isActiveMarker ? 36 : 30}px;
-            height:${isActiveMarker ? 36 : 30}px;
-            border-radius:50%;
-            border:${isActiveMarker ? 3 : 2}px solid ${style.border || '#fff'};
-            color:${style.border ? style.border : '#fff'};
+            width:${markerSize}px;
+            height:${markerSize}px;
+            border-radius:${Math.round(markerSize * 0.28)}px;
+            border:${isActiveMarker ? 3 : 2}px solid ${borderColor};
+            background-image:linear-gradient(180deg, rgba(15,23,42,0.08), rgba(15,23,42,0.34)), url('${safeImageUrl}');
+            background-size:cover;
+            background-position:center;
+            position:relative;
+            overflow:hidden;
+            opacity:${markerOpacity};
+            filter:${marker.dimmed ? 'saturate(0.7) brightness(0.94)' : 'none'};
+            box-shadow:${isActiveMarker ? `0 0 0 5px rgba(37,99,235,0.18), 0 18px 34px ${markerShadowColor}44` : `0 14px 28px ${markerShadowColor}33`};
+            transform:${isActiveMarker ? 'scale(1.07)' : 'scale(1)'};
+            transition:all 0.18s ease;
+          ">
+            <div style="
+              position:absolute;
+              inset:0;
+              background:linear-gradient(180deg, rgba(255,255,255,0.12), transparent 35%, rgba(15,23,42,0.16) 100%);
+            "></div>
+            <div style="
+              position:absolute;
+              left:8px;
+              top:8px;
+              padding:3px 7px;
+              border-radius:999px;
+              background:rgba(15,23,42,0.76);
+              color:#ffffff;
+              font-size:${isActiveMarker ? 11 : 10}px;
+              font-weight:800;
+              letter-spacing:0.2px;
+              backdrop-filter:blur(8px);
+            ">${badgeLabel}</div>
+          </div>
+        `
+        : `
+          <div style="
+            background:${backgroundColor};
+            width:${markerWidth}px;
+            height:${markerHeight}px;
+            border-radius:${isWideLabel ? 999 : 50}%;
+            border:${isActiveMarker ? 3 : 2}px solid ${borderColor};
+            color:${textColor};
             font-size:${isActiveMarker ? 13 : 12}px;
             font-weight:700;
             display:flex;
             align-items:center;
             justify-content:center;
+            padding:${isWideLabel ? '0 8px' : '0'};
+            letter-spacing:${isWideLabel ? '0.2px' : '0'};
+            opacity:${markerOpacity};
             box-shadow:${isActiveMarker ? '0 0 0 5px rgba(37,99,235,0.18), 0 12px 28px rgba(15,23,42,0.28)' : style.ring || '0 6px 16px rgba(15,23,42,0.24)'};
             transform:${isActiveMarker ? 'scale(1.05)' : 'scale(1)'};
             transition:all 0.18s ease;
+            filter:${marker.dimmed ? 'saturate(0.78)' : 'none'};
           ">${label}</div>
-        `,
-        iconSize: [isActiveMarker ? 36 : 30, isActiveMarker ? 36 : 30],
-        iconAnchor: [isActiveMarker ? 18 : 15, isActiveMarker ? 18 : 15],
+        `;
+
+      const icon = L.divIcon({
+        className: 'custom-marker',
+        html: iconHtml,
+        iconSize: shouldUseCoverMarker ? [markerSize, markerSize] : [markerWidth, markerHeight],
+        iconAnchor: shouldUseCoverMarker ? [markerSize / 2, markerSize / 2] : [markerWidth / 2, markerHeight / 2],
       });
 
-      const markerLayer = L.marker(adjustedPosition, {
+      const dynamicTooltipPlacement = tooltipPlacementMap.get(marker.id);
+
+      const markerLayer = L.marker(marker.adjustedPosition, {
         icon,
-        zIndexOffset: isActiveMarker ? 320 : 120,
-      })
-        .addTo(map)
-        .bindPopup(marker.title);
+        zIndexOffset: marker.zIndexOffset ?? (isActiveMarker ? 320 : 120),
+      }).addTo(map);
+
+      if (marker.title && !marker.disablePopup) {
+        markerLayer.bindPopup(marker.title);
+      }
+
+      if (marker.tooltipHtml) {
+        markerLayer.bindTooltip(marker.tooltipHtml, {
+          permanent: marker.tooltipPermanent ?? false,
+          direction: dynamicTooltipPlacement?.direction || marker.tooltipDirection || 'top',
+          offset: dynamicTooltipPlacement
+            ? L.point(dynamicTooltipPlacement.offset[0], dynamicTooltipPlacement.offset[1])
+            : marker.tooltipOffset
+            ? L.point(marker.tooltipOffset[0], marker.tooltipOffset[1])
+            : L.point(0, -18),
+          opacity: 1,
+          className: 'journey-map-tooltip',
+        });
+      }
 
       if (onMarkerSelect) {
         markerLayer.on('click', () => onMarkerSelect(marker));
       }
+
     }
 
-    const allPoints = viewportPoints.map((point) => L.latLng(point[0], point[1]));
-    const viewportKey = allPoints.map((point) => `${point.lat.toFixed(5)}:${point.lng.toFixed(5)}`).join('|');
-
-    if (allPoints.length > 1) {
-      if (lastViewportKeyRef.current !== viewportKey) {
-        map.fitBounds(L.latLngBounds(allPoints), { padding: [32, 32] });
-        lastViewportKeyRef.current = viewportKey;
-      }
-    } else if (allPoints.length === 1) {
-      if (lastViewportKeyRef.current !== viewportKey) {
-        map.setView(allPoints[0], zoom);
-        lastViewportKeyRef.current = viewportKey;
-      }
-    } else {
-      const fallbackKey = `${center[0].toFixed(5)}:${center[1].toFixed(5)}:${zoom}`;
-      if (lastViewportKeyRef.current !== fallbackKey) {
-        map.setView(center, zoom);
-        lastViewportKeyRef.current = fallbackKey;
-      }
-    }
   }, [
     activeRouteLegId,
     center,
@@ -590,6 +817,8 @@ const MapComponent: React.FC<MapComponentProps> = ({
     routeSource,
     showDirectionArrows,
     showRoadNetwork,
+    focusZoom,
+    preferFocusPoints,
     zoom,
   ]);
 

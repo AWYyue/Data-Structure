@@ -1,3 +1,6 @@
+import { CITY_SCENIC_COORDINATE_OVERRIDES } from '../data/cityTravelCoordinates';
+import { REAL_SCENIC_CATALOG } from '../data/realScenicCatalog';
+
 type ScenicPresentable = {
   name: string;
   category?: string | null;
@@ -95,6 +98,19 @@ const fallbackAssets: ScenicAsset[] = [
 ];
 
 const knownCities = Object.keys(cityImageBank);
+const exactCityByName = new Map<string, string>();
+
+Object.entries(CITY_SCENIC_COORDINATE_OVERRIDES).forEach(([cityLabel, coordinates]) => {
+  Object.keys(coordinates).forEach((name) => {
+    exactCityByName.set(name, cityLabel);
+  });
+});
+
+REAL_SCENIC_CATALOG.forEach((item) => {
+  if (!exactCityByName.has(item.name)) {
+    exactCityByName.set(item.name, item.city);
+  }
+});
 
 const invalidCoverPattern =
   /(?:\.pdf|\.djvu|\.webm|student[_ -]?card|temporary[_ -]?site|name[_ -]?wall|logo|emblem|badge|icon|hospital|middle[_ -]?school|station|metro|subway|platform|route[_ -]?map|ceremony|graduation|statue|stone|decoration|campaign|memorial|museum[_ -]?decoration|michel[_ -]?talagrand|liu[_ -]?yu|总医院|总院|医院|地铁|站台|换轨|装饰|纪念|牌匾|牌坊|动物园站|财经大学站|附属|中学)/i;
@@ -119,6 +135,11 @@ const hasValidCover = (scenic: ScenicPresentable) => {
 };
 
 const resolveCityLabel = (name: string, description?: string | null, tags?: string | string[] | null) => {
+  const exactMatchCity = exactCityByName.get(name);
+  if (exactMatchCity) {
+    return exactMatchCity;
+  }
+
   const searchableText = [name, description || '', Array.isArray(tags) ? tags.join(',') : tags || ''].join(' ');
 
   for (const city of knownCities) {

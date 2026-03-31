@@ -4,7 +4,11 @@ import { UserBehavior } from '../entities/UserBehavior';
 import { User } from '../entities/User';
 import { Food } from '../entities/Food';
 import { Diary } from '../entities/Diary';
+import { Attraction } from '../entities/Attraction';
+import { Facility } from '../entities/Facility';
+import { PhotoSpot } from '../entities/PhotoSpot';
 import cache from '../config/cache';
+import { CITY_SCENIC_COORDINATE_OVERRIDES, CITY_TRAVEL_ANCHORS, CoordinatePoint } from '../data/cityTravelCoordinates';
 import { resolveScenicPresentation, ScenicPresentation } from '../utils/scenicPresentation';
 
 // 获取仓库
@@ -41,6 +45,106 @@ function getDiaryRepository() {
     throw new Error('Database not initialized');
   }
   return AppDataSource.getRepository(Diary);
+}
+
+function getAttractionRepository() {
+  if (!AppDataSource) {
+    throw new Error('Database not initialized');
+  }
+  return AppDataSource.getRepository(Attraction);
+}
+
+function getFacilityRepository() {
+  if (!AppDataSource) {
+    throw new Error('Database not initialized');
+  }
+  return AppDataSource.getRepository(Facility);
+}
+
+function getPhotoSpotRepository() {
+  if (!AppDataSource) {
+    throw new Error('Database not initialized');
+  }
+  return AppDataSource.getRepository(PhotoSpot);
+}
+
+export type CityTravelTheme =
+  | 'comprehensive'
+  | 'foodie'
+  | 'photographer'
+  | 'culture'
+  | 'nature'
+  | 'relaxation'
+  | 'personalized';
+
+export interface CityDestinationOption {
+  cityLabel: string;
+  scenicCount: number;
+  averageRating: number;
+  averagePopularity: number;
+  center: { latitude: number; longitude: number };
+  coverImageUrl: string;
+  coverImageTheme: string;
+  featuredScenicAreas: Array<{
+    id: string;
+    name: string;
+    category: string;
+    latitude: number | null;
+    longitude: number | null;
+    averageRating: number;
+    popularity: number;
+  }>;
+}
+
+export interface CityItineraryStop {
+  id: string;
+  scenicAreaId: string;
+  scenicAreaName: string;
+  day: number;
+  order: number;
+  latitude: number;
+  longitude: number;
+  averageRating: number;
+  popularity: number;
+  coverImageUrl: string;
+  coverImageTheme: string;
+  cityLabel: string;
+  reason: string;
+  highlightTags: string[];
+}
+
+export interface CityItineraryDay {
+  day: number;
+  title: string;
+  estimatedDistanceKm: number;
+  estimatedTimeMinutes: number;
+  stops: CityItineraryStop[];
+}
+
+export interface CityItinerarySegment {
+  id: string;
+  day: number;
+  order: number;
+  fromStopId: string;
+  toStopId: string;
+  points: Array<{ latitude: number; longitude: number }>;
+  color: string;
+  label: string;
+}
+
+export interface CityTravelItinerary {
+  cityLabel: string;
+  theme: CityTravelTheme;
+  tripDays: number;
+  center: { latitude: number; longitude: number };
+  days: CityItineraryDay[];
+  segments: CityItinerarySegment[];
+  legend: Array<{ id: string; label: string; color: string }>;
+  summary: {
+    totalStops: number;
+    cityScenicCount: number;
+    variationSignals: string[];
+  };
 }
 
 // 简单的最小堆实现
@@ -751,7 +855,688 @@ export class RecommendationService {
     return minHeap.getTopK().map(item => item.diary);
   }
 
+  async getCityDestinationOptions(limit: number = 12): Promise<CityDestinationOption[]> {
+    const scenicAreaRepository = getScenicAreaRepository();
+    const allAreas = this.presentScenicAreas(await scenicAreaRepository.find()) as Array<ScenicArea & ScenicPresentation>;
+    const grouped = new Map<string, Array<ScenicArea & ScenicPresentation>>();
+
+    allAreas
+      .filter((area) => area.category === '景区')
+      .forEach((area) => {
+        const cityLabel = area.cityLabel || '精选目的地';
+        if (!grouped.has(cityLabel)) {
+          grouped.set(cityLabel, []);
+        }
+        grouped.get(cityLabel)!.push(area);
+      });
+
+    return Array.from(grouped.entries())
+      .map(([cityLabel, areas]) => {
+        const resolvedCoordinates = this.resolveCityAreaCoordinates(cityLabel, areas);
+        const center = this.computeCityCenter(Array.from(resolvedCoordinates.values()));
+        const featuredScenicAreas = [...areas]
+          .sort(
+            (left, right) =>
+              Number(right.popularity || 0) - Number(left.popularity || 0) ||
+              Number(right.averageRating || 0) - Number(left.averageRating || 0),
+          )
+          .slice(0, 3)
+          .map((area) => {
+            const coordinate = resolvedCoordinates.get(area.id) || this.resolveSingleAreaCoordinate(cityLabel, area);
+            return {
+              id: area.id,
+              name: area.name,
+              category: area.category,
+              latitude: coordinate.latitude,
+              longitude: coordinate.longitude,
+              averageRating: Number(area.averageRating || 0),
+              popularity: Number(area.popularity || 0),
+            };
+          });
+
+        return {
+          cityLabel,
+          scenicCount: areas.length,
+          averageRating: Number(
+            (areas.reduce((sum, area) => sum + Number(area.averageRating || 0), 0) / Math.max(areas.length, 1)).toFixed(2),
+          ),
+          averagePopularity: Number(
+            (
+              areas.reduce((sum, area) => sum + Number(area.popularity || area.visitorCount || 0), 0) /
+              Math.max(areas.length, 1)
+            ).toFixed(0),
+          ),
+          center,
+          coverImageUrl: areas[0]?.coverImageUrl || '',
+          coverImageTheme: areas[0]?.coverImageTheme || cityLabel,
+          featuredScenicAreas,
+        } satisfies CityDestinationOption;
+      })
+      .filter((item) => Number.isFinite(item.center.latitude) && Number.isFinite(item.center.longitude))
+      .sort((left, right) => right.scenicCount - left.scenicCount || right.averagePopularity - left.averagePopularity)
+      .slice(0, limit);
+  }
+
+  async generateCityTravelItinerary(
+    userId: string,
+    cityLabel: string,
+    theme: CityTravelTheme,
+    tripDays: number,
+  ): Promise<CityTravelItinerary> {
+    const scenicAreaRepository = getScenicAreaRepository();
+    const attractionRepository = getAttractionRepository();
+    const facilityRepository = getFacilityRepository();
+    const photoSpotRepository = getPhotoSpotRepository();
+    const foodRepository = getFoodRepository();
+    const userRepository = getUserRepository();
+
+    const user = await userRepository.findOne({ where: { id: userId } });
+    if (!user) {
+      throw new Error('User not found');
+    }
+
+    const normalizedTheme = this.normalizeCityTravelTheme(theme);
+    const normalizedTripDays = Math.max(1, Math.min(3, Math.round(Number(tripDays) || 1)));
+    const allAreas = this.presentScenicAreas(await scenicAreaRepository.find()) as Array<ScenicArea & ScenicPresentation>;
+    const cityAreas = allAreas.filter(
+      (area) =>
+        area.category === '景区' &&
+        (area.cityLabel || '精选目的地') === cityLabel &&
+        true,
+    );
+
+    if (!cityAreas.length) {
+      throw new Error(`No scenic areas found for city ${cityLabel}`);
+    }
+
+    const resolvedCoordinates = this.resolveCityAreaCoordinates(cityLabel, cityAreas);
+
+    const scenicAreaIds = cityAreas.map((area) => area.id);
+    const [attractions, facilities, photoSpots] = await Promise.all([
+      attractionRepository.find({ where: { scenicAreaId: In(scenicAreaIds) } }),
+      facilityRepository.find({ where: { scenicAreaId: In(scenicAreaIds) } }),
+      photoSpotRepository.find({ where: { scenicAreaId: In(scenicAreaIds) } }),
+    ]);
+
+    const foods = facilities.length
+      ? await foodRepository.find({ where: { facilityId: In(facilities.map((item) => item.id)) } })
+      : [];
+
+    const attractionMap = this.groupByScenicArea(attractions, (item) => item.scenicAreaId);
+    const facilityMap = this.groupByScenicArea(facilities, (item) => item.scenicAreaId);
+    const photoSpotMap = this.groupByScenicArea(photoSpots, (item) => item.scenicAreaId);
+    const facilityToScenicMap = new Map(facilities.map((item) => [item.id, item.scenicAreaId] as const));
+    const foodMap = new Map<string, Food[]>();
+    foods.forEach((item) => {
+      const scenicAreaId = facilityToScenicMap.get(item.facilityId);
+      if (!scenicAreaId) {
+        return;
+      }
+      const current = foodMap.get(scenicAreaId) || [];
+      current.push(item);
+      foodMap.set(scenicAreaId, current);
+    });
+
+    const selectedInterests = this.normalizeUserInterests(user.interests || []);
+    const scoredAreas = cityAreas
+      .map((area) =>
+        this.scoreCityAreaForTheme(
+          area,
+          normalizedTheme,
+          selectedInterests,
+          attractionMap.get(area.id) || [],
+          facilityMap.get(area.id) || [],
+          foodMap.get(area.id) || [],
+          photoSpotMap.get(area.id) || [],
+        ),
+      )
+      .sort((left, right) => right.score - left.score);
+
+    const stopsPerDay = normalizedTripDays === 1 ? 4 : 3;
+    const selectedCount = Math.min(cityAreas.length, Math.max(normalizedTripDays * stopsPerDay, normalizedTripDays * 2));
+    const selectedAreas = scoredAreas.slice(0, selectedCount);
+    const dayBuckets = this.allocateStopsToDays(selectedAreas, normalizedTripDays);
+    const dayColors = ['#2563eb', '#16a34a', '#f59e0b'];
+
+    const days: CityItineraryDay[] = [];
+    const segments: CityItinerarySegment[] = [];
+
+    dayBuckets.forEach((bucket, dayIndex) => {
+      const ordered = this.orderCityStopsForDay(bucket);
+      const stops: CityItineraryStop[] = ordered.map((item, stopIndex) => {
+        const coordinate = resolvedCoordinates.get(item.area.id) || this.resolveSingleAreaCoordinate(cityLabel, item.area);
+        return {
+          id: `${item.area.id}-d${dayIndex + 1}-${stopIndex + 1}`,
+          scenicAreaId: item.area.id,
+          scenicAreaName: item.area.name,
+          day: dayIndex + 1,
+          order: stopIndex + 1,
+          latitude: coordinate.latitude,
+          longitude: coordinate.longitude,
+          averageRating: Number(item.area.averageRating || 0),
+          popularity: Number(item.area.popularity || item.area.visitorCount || 0),
+          coverImageUrl: item.area.coverImageUrl,
+          coverImageTheme: item.area.coverImageTheme,
+          cityLabel: item.area.cityLabel || cityLabel,
+          reason: item.reason,
+          highlightTags: item.highlightTags,
+        };
+      });
+
+      let distance = 0;
+      for (let index = 1; index < stops.length; index += 1) {
+        distance += this.haversineKm(
+          stops[index - 1].latitude,
+          stops[index - 1].longitude,
+          stops[index].latitude,
+          stops[index].longitude,
+        );
+        segments.push({
+          id: `day-${dayIndex + 1}-segment-${index}`,
+          day: dayIndex + 1,
+          order: index,
+          fromStopId: stops[index - 1].id,
+          toStopId: stops[index].id,
+          points: this.buildOverviewSegmentPoints(stops[index - 1], stops[index], dayIndex + 1, index),
+          color: dayColors[dayIndex % dayColors.length],
+          label: `第${dayIndex + 1}天 · 第${index}段`,
+        });
+      }
+
+      days.push({
+        day: dayIndex + 1,
+        title: `第 ${dayIndex + 1} 天`,
+        estimatedDistanceKm: Number(distance.toFixed(2)),
+        estimatedTimeMinutes: this.estimateCityDayTimeMinutes(stops.length, distance, normalizedTheme),
+        stops,
+      });
+    });
+
+    return {
+      cityLabel,
+      theme: normalizedTheme,
+      tripDays: normalizedTripDays,
+      center: this.computeCityCenter(Array.from(resolvedCoordinates.values())),
+      days,
+      segments,
+      legend: days.map((day, index) => ({
+        id: `day-${day.day}`,
+        label: day.title,
+        color: dayColors[index % dayColors.length],
+      })),
+      summary: {
+        totalStops: days.reduce((sum, day) => sum + day.stops.length, 0),
+        cityScenicCount: cityAreas.length,
+        variationSignals: this.buildVariationSignals(normalizedTheme, selectedInterests),
+      },
+    };
+  }
+
   // 获取热门景点（作为备选推荐）
+  private normalizeCityTravelTheme(theme: string): CityTravelTheme {
+    if (
+      theme === 'foodie' ||
+      theme === 'photographer' ||
+      theme === 'culture' ||
+      theme === 'nature' ||
+      theme === 'relaxation' ||
+      theme === 'personalized'
+    ) {
+      return theme;
+    }
+    return 'comprehensive';
+  }
+
+  private normalizeUserInterests(interests: unknown): string[] {
+    if (Array.isArray(interests)) {
+      return Array.from(new Set(interests.map((item) => String(item || '').trim()).filter(Boolean)));
+    }
+
+    if (typeof interests === 'string') {
+      const trimmed = interests.trim();
+      if (!trimmed || trimmed === '[object Object]') {
+        return [];
+      }
+
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          return Array.from(new Set(parsed.map((item) => String(item || '').trim()).filter(Boolean)));
+        }
+      } catch {
+        // fall through to delimiter parsing
+      }
+
+      return Array.from(
+        new Set(
+          trimmed
+            .replace(/^\[|\]$/g, '')
+            .split(/[,\uFF0C|]/)
+            .map((item) => item.trim().replace(/^["']|["']$/g, ''))
+            .filter(Boolean),
+        ),
+      );
+    }
+
+    return [];
+  }
+
+  private toCoordinatePoint(latitude: number | null | undefined, longitude: number | null | undefined): CoordinatePoint | null {
+    const safeLatitude = Number(latitude);
+    const safeLongitude = Number(longitude);
+    if (!Number.isFinite(safeLatitude) || !Number.isFinite(safeLongitude)) {
+      return null;
+    }
+
+    return {
+      latitude: Number(safeLatitude.toFixed(6)),
+      longitude: Number(safeLongitude.toFixed(6)),
+    };
+  }
+
+  private areCoordinatesCollapsed(points: CoordinatePoint[]) {
+    const valid = points.filter(
+      (point) => Number.isFinite(Number(point.latitude)) && Number.isFinite(Number(point.longitude)),
+    );
+
+    if (valid.length <= 1) {
+      return true;
+    }
+
+    const uniqueRounded = new Set(valid.map((point) => `${point.latitude.toFixed(4)}:${point.longitude.toFixed(4)}`));
+    if (uniqueRounded.size <= Math.max(2, Math.ceil(valid.length / 4))) {
+      return true;
+    }
+
+    let maxDistance = 0;
+    for (let index = 0; index < valid.length; index += 1) {
+      for (let nextIndex = index + 1; nextIndex < valid.length; nextIndex += 1) {
+        maxDistance = Math.max(
+          maxDistance,
+          this.haversineKm(
+            valid[index].latitude,
+            valid[index].longitude,
+            valid[nextIndex].latitude,
+            valid[nextIndex].longitude,
+          ),
+        );
+      }
+    }
+
+    return maxDistance < 2;
+  }
+
+  private getCityAnchor(cityLabel: string) {
+    return CITY_TRAVEL_ANCHORS[cityLabel] || { latitude: 39.9042, longitude: 116.4074, spreadKm: 16 };
+  }
+
+  private offsetCoordinate(anchor: CoordinatePoint, distanceKm: number, bearingDegrees: number): CoordinatePoint {
+    const earthRadiusKm = 6371;
+    const bearing = (bearingDegrees * Math.PI) / 180;
+    const lat1 = (anchor.latitude * Math.PI) / 180;
+    const lng1 = (anchor.longitude * Math.PI) / 180;
+    const angularDistance = distanceKm / earthRadiusKm;
+
+    const lat2 = Math.asin(
+      Math.sin(lat1) * Math.cos(angularDistance) +
+        Math.cos(lat1) * Math.sin(angularDistance) * Math.cos(bearing),
+    );
+    const lng2 =
+      lng1 +
+      Math.atan2(
+        Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(lat1),
+        Math.cos(angularDistance) - Math.sin(lat1) * Math.sin(lat2),
+      );
+
+    return {
+      latitude: Number(((lat2 * 180) / Math.PI).toFixed(6)),
+      longitude: Number(((lng2 * 180) / Math.PI).toFixed(6)),
+    };
+  }
+
+  private buildGeneratedAreaCoordinate(cityLabel: string, area: ScenicArea & ScenicPresentation, index: number) {
+    const anchor = this.getCityAnchor(cityLabel);
+    const baseAngle = this.stableHash(`${cityLabel}:${area.name}`) % 360;
+    const ringIndex = Math.floor(index / 4);
+    const slotIndex = index % 4;
+    const ringDistanceKm = Math.min(anchor.spreadKm, 2.5 + ringIndex * 3.1 + slotIndex * 0.35);
+    const bearingDegrees = (baseAngle + slotIndex * 67 + ringIndex * 19) % 360;
+    return this.offsetCoordinate(anchor, ringDistanceKm, bearingDegrees);
+  }
+
+  private resolveSingleAreaCoordinate(cityLabel: string, area: ScenicArea & ScenicPresentation): CoordinatePoint {
+    const knownCoordinate = CITY_SCENIC_COORDINATE_OVERRIDES[cityLabel]?.[area.name];
+    if (knownCoordinate) {
+      return knownCoordinate;
+    }
+
+    return this.toCoordinatePoint(area.latitude, area.longitude) || this.buildGeneratedAreaCoordinate(cityLabel, area, 0);
+  }
+
+  private resolveCityAreaCoordinates(cityLabel: string, areas: Array<ScenicArea & ScenicPresentation>) {
+    const resolved = new Map<string, CoordinatePoint>();
+    const rawCoordinates = areas
+      .map((area) => this.toCoordinatePoint(area.latitude, area.longitude))
+      .filter((point): point is CoordinatePoint => point !== null);
+    const useFallbackCoordinates = this.areCoordinatesCollapsed(rawCoordinates);
+    const sortedAreas = [...areas].sort(
+      (left, right) =>
+        Number(right.popularity || right.visitorCount || 0) - Number(left.popularity || left.visitorCount || 0) ||
+        Number(right.averageRating || 0) - Number(left.averageRating || 0),
+    );
+
+    sortedAreas.forEach((area, index) => {
+      const knownCoordinate = CITY_SCENIC_COORDINATE_OVERRIDES[cityLabel]?.[area.name];
+      const rawCoordinate = this.toCoordinatePoint(area.latitude, area.longitude);
+      const coordinate =
+        knownCoordinate ||
+        (!useFallbackCoordinates && rawCoordinate ? rawCoordinate : null) ||
+        this.buildGeneratedAreaCoordinate(cityLabel, area, index);
+      resolved.set(area.id, coordinate);
+    });
+
+    return resolved;
+  }
+
+  private buildOverviewSegmentPoints(
+    fromStop: { latitude: number; longitude: number },
+    toStop: { latitude: number; longitude: number },
+    day: number,
+    order: number,
+  ) {
+    const from = { latitude: fromStop.latitude, longitude: fromStop.longitude };
+    const to = { latitude: toStop.latitude, longitude: toStop.longitude };
+    const straightDistance = this.haversineKm(from.latitude, from.longitude, to.latitude, to.longitude);
+
+    if (straightDistance < 0.6) {
+      return [from, to];
+    }
+
+    const midLatitude = (from.latitude + to.latitude) / 2;
+    const midLongitude = (from.longitude + to.longitude) / 2;
+    const latDelta = to.latitude - from.latitude;
+    const lngDelta = to.longitude - from.longitude;
+    const vectorLength = Math.sqrt(latDelta * latDelta + lngDelta * lngDelta) || 1;
+    const curveDirection = this.stableHash(`${day}:${order}:${from.latitude}:${to.longitude}`) % 2 === 0 ? 1 : -1;
+    const curveOffset = Math.min(0.04, vectorLength * 0.18) * curveDirection;
+
+    return [
+      from,
+      {
+        latitude: Number((midLatitude - (lngDelta / vectorLength) * curveOffset).toFixed(6)),
+        longitude: Number((midLongitude + (latDelta / vectorLength) * curveOffset).toFixed(6)),
+      },
+      to,
+    ];
+  }
+
+  private computeCityCenter(areas: Array<{ latitude: number | null; longitude: number | null }>) {
+    const valid = areas.filter(
+      (area) => Number.isFinite(Number(area.latitude)) && Number.isFinite(Number(area.longitude)),
+    );
+    if (!valid.length) {
+      return { latitude: 39.9042, longitude: 116.4074 };
+    }
+
+    const latitude = valid.reduce((sum, area) => sum + Number(area.latitude || 0), 0) / Math.max(valid.length, 1);
+    const longitude = valid.reduce((sum, area) => sum + Number(area.longitude || 0), 0) / Math.max(valid.length, 1);
+    return {
+      latitude: Number(latitude.toFixed(6)),
+      longitude: Number(longitude.toFixed(6)),
+    };
+  }
+
+  private groupByScenicArea<T>(items: T[], getScenicAreaId: (item: T) => string) {
+    const grouped = new Map<string, T[]>();
+    items.forEach((item) => {
+      const scenicAreaId = getScenicAreaId(item);
+      if (!grouped.has(scenicAreaId)) {
+        grouped.set(scenicAreaId, []);
+      }
+      grouped.get(scenicAreaId)!.push(item);
+    });
+    return grouped;
+  }
+
+  private scoreCityAreaForTheme(
+    area: ScenicArea & ScenicPresentation,
+    theme: CityTravelTheme,
+    selectedInterests: string[],
+    attractions: Attraction[],
+    facilities: Facility[],
+    foods: Food[],
+    photoSpots: PhotoSpot[],
+  ) {
+    const text = [
+      area.name,
+      area.description || '',
+      Array.isArray(area.tags) ? area.tags.join(' ') : area.tags || '',
+      ...attractions.map((item) => `${item.name} ${item.category || ''} ${item.type || ''} ${item.description || ''}`),
+      ...facilities.map((item) => `${item.name} ${item.category || ''} ${item.description || ''}`),
+      ...foods.map((item) => `${item.name} ${item.cuisine || ''} ${item.description || ''}`),
+      ...photoSpots.map((item) => `${item.name} ${item.description || ''} ${item.bestTime || ''}`),
+    ]
+      .join(' ')
+      .toLowerCase();
+
+    const cuisineDiversity = new Set(foods.map((item) => String(item.cuisine || '').trim()).filter(Boolean)).size;
+    const photoPopularity = photoSpots.reduce((sum, item) => sum + Number(item.popularity || 0), 0);
+    const cultureCount = attractions.filter((item) =>
+      ['historic', 'museum', 'culture'].includes(String(item.type || '').toLowerCase()),
+    ).length;
+    const viewpointCount = attractions.filter((item) =>
+      ['viewpoint', 'garden'].includes(String(item.type || '').toLowerCase()) ||
+      String(item.category || '').includes('观景'),
+    ).length;
+
+    const ratingScore = Number(area.averageRating || area.rating || 0) * 1.5;
+    const popularityScore = Number(area.popularity || area.visitorCount || 0) / 35000;
+    const foodScore =
+      foods.length * 0.12 +
+      cuisineDiversity * 0.9 +
+      this.keywordScore(text, ['美食', '小吃', '火锅', '面', '饭', '街', '巷', '坊', '夜', '吃']) * 1.2;
+    const photoScore =
+      photoSpots.length * 0.9 +
+      photoPopularity / 400 +
+      viewpointCount * 0.8 +
+      this.keywordScore(text, ['摄影', '拍照', '打卡', '观景', '夜景', '塔', '楼', '湖', '桥']) * 1.15;
+    const cultureScore =
+      cultureCount * 1.1 +
+      this.keywordScore(text, ['博物', '故宫', '宫', '寺', '楼', '古', '遗址', '文化', '历史']) * 1.35;
+    const natureScore =
+      viewpointCount * 0.55 +
+      this.keywordScore(text, ['公园', '山', '湖', '湿地', '谷', '园', '海', '林', '自然']) * 1.25;
+    const relaxScore = natureScore * 0.7 + ratingScore * 0.35 + Math.max(0, 4 - popularityScore);
+    const comprehensiveScore =
+      ratingScore +
+      popularityScore +
+      (foodScore + photoScore + cultureScore + natureScore) * 0.22;
+
+    const personalizedBoost = selectedInterests.reduce((sum, interest) => {
+      if (interest === 'foodie') return sum + foodScore * 0.45;
+      if (interest === 'photographer') return sum + photoScore * 0.45;
+      if (interest === 'cultureEnthusiast') return sum + cultureScore * 0.45;
+      if (interest === 'natureLover') return sum + natureScore * 0.45;
+      if (interest === 'relaxationSeeker') return sum + relaxScore * 0.35;
+      return sum + comprehensiveScore * 0.08;
+    }, 0);
+
+    const stableBias = (this.stableHash(`${theme}:${area.id}`) % 19) / 100;
+    const totalScore =
+      theme === 'foodie'
+        ? foodScore * 1.8 + ratingScore * 0.4 + popularityScore * 0.35 + stableBias
+        : theme === 'photographer'
+        ? photoScore * 1.9 + natureScore * 0.35 + ratingScore * 0.3 + stableBias
+        : theme === 'culture'
+        ? cultureScore * 1.9 + ratingScore * 0.4 + popularityScore * 0.25 + stableBias
+        : theme === 'nature'
+        ? natureScore * 1.9 + photoScore * 0.35 + relaxScore * 0.25 + stableBias
+        : theme === 'relaxation'
+        ? relaxScore * 1.9 + natureScore * 0.35 + ratingScore * 0.25 + stableBias
+        : theme === 'personalized'
+        ? comprehensiveScore * 0.9 + personalizedBoost + stableBias
+        : comprehensiveScore + stableBias;
+
+    const highlightTags = this.buildHighlightTags(theme, {
+      cuisineDiversity,
+      foodCount: foods.length,
+      photoCount: photoSpots.length,
+      cultureCount,
+      viewpointCount,
+    });
+
+    return {
+      area,
+      score: Number(totalScore.toFixed(4)),
+      reason: this.buildThemeReason(theme, area.name, highlightTags, selectedInterests),
+      highlightTags,
+    };
+  }
+
+  private buildHighlightTags(
+    theme: CityTravelTheme,
+    metrics: {
+      cuisineDiversity: number;
+      foodCount: number;
+      photoCount: number;
+      cultureCount: number;
+      viewpointCount: number;
+    },
+  ) {
+    const tags: string[] = [];
+    if (metrics.foodCount >= 12 || metrics.cuisineDiversity >= 4) tags.push('美食丰富');
+    if (metrics.photoCount >= 3 || metrics.viewpointCount >= 2) tags.push('适合拍照');
+    if (metrics.cultureCount >= 3) tags.push('文化看点');
+    if (metrics.viewpointCount >= 3) tags.push('景观路线');
+    if (!tags.length) {
+      tags.push(theme === 'foodie' ? '适合吃逛' : theme === 'photographer' ? '适合打卡' : '综合体验');
+    }
+    return tags.slice(0, 3);
+  }
+
+  private buildThemeReason(
+    theme: CityTravelTheme,
+    areaName: string,
+    highlightTags: string[],
+    selectedInterests: string[],
+  ) {
+    if (theme === 'foodie') {
+      return `${areaName} 的餐饮与逛吃内容更集中，适合排进美食主题行程。`;
+    }
+    if (theme === 'photographer') {
+      return `${areaName} 的摄影位和观景内容更突出，适合作为拍照主题站点。`;
+    }
+    if (theme === 'culture') {
+      return `${areaName} 的历史文化标签更强，适合作为文化主题重点站。`;
+    }
+    if (theme === 'nature') {
+      return `${areaName} 的景观与自然氛围更明显，适合作为自然主题游览点。`;
+    }
+    if (theme === 'relaxation') {
+      return `${areaName} 更适合慢节奏停留，可放入轻松休闲路线。`;
+    }
+    if (theme === 'personalized') {
+      return `${areaName} 与你的兴趣画像匹配更高，命中了 ${highlightTags.concat(selectedInterests).slice(0, 2).join('、')}。`;
+    }
+    return `${areaName} 在热度、评分和体验维度上更均衡，适合作为综合路线站点。`;
+  }
+
+  private keywordScore(text: string, keywords: string[]) {
+    return keywords.reduce((sum, keyword) => sum + (text.includes(keyword.toLowerCase()) ? 1 : 0), 0);
+  }
+
+  private stableHash(value: string) {
+    let result = 7;
+    for (const char of value) {
+      result = (result * 31 + char.charCodeAt(0)) % 2147483647;
+    }
+    return result;
+  }
+
+  private allocateStopsToDays<T>(items: T[], tripDays: number) {
+    const buckets = Array.from({ length: tripDays }, () => [] as T[]);
+    items.forEach((item, index) => {
+      buckets[index % tripDays].push(item);
+    });
+    return buckets.filter((bucket) => bucket.length > 0);
+  }
+
+  private orderCityStopsForDay<T extends { area: { latitude: number | null; longitude: number | null } }>(items: T[]) {
+    if (items.length <= 2) {
+      return items;
+    }
+
+    const remaining = [...items.slice(1)];
+    const ordered = [items[0]];
+
+    while (remaining.length) {
+      const current = ordered[ordered.length - 1];
+      let nextIndex = 0;
+      let minDistance = Number.POSITIVE_INFINITY;
+      remaining.forEach((candidate, index) => {
+        const distance = this.haversineKm(
+          Number(current.area.latitude || 0),
+          Number(current.area.longitude || 0),
+          Number(candidate.area.latitude || 0),
+          Number(candidate.area.longitude || 0),
+        );
+        if (distance < minDistance) {
+          minDistance = distance;
+          nextIndex = index;
+        }
+      });
+      ordered.push(remaining.splice(nextIndex, 1)[0]);
+    }
+
+    return ordered;
+  }
+
+  private haversineKm(lat1: number, lng1: number, lat2: number, lng2: number) {
+    const toRadians = (value: number) => (value * Math.PI) / 180;
+    const earthRadiusKm = 6371;
+    const dLat = toRadians(lat2 - lat1);
+    const dLng = toRadians(lng2 - lng1);
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return earthRadiusKm * c;
+  }
+
+  private estimateCityDayTimeMinutes(stopCount: number, distanceKm: number, theme: CityTravelTheme) {
+    const stayPerStop =
+      theme === 'foodie' ? 110 :
+      theme === 'photographer' ? 95 :
+      theme === 'culture' ? 100 :
+      theme === 'nature' ? 90 :
+      theme === 'relaxation' ? 120 :
+      95;
+
+    return Number((stopCount * stayPerStop + distanceKm * 18).toFixed(0));
+  }
+
+  private buildVariationSignals(theme: CityTravelTheme, selectedInterests: string[]) {
+    if (theme === 'foodie') {
+      return ['优先选择餐饮丰富的景区', '更偏向街区与逛吃型目的地'];
+    }
+    if (theme === 'photographer') {
+      return ['优先选择摄影位与观景内容更多的景区', '更强调出片与打卡顺序'];
+    }
+    if (theme === 'culture') {
+      return ['优先选择历史文化向景区', '更强调博物馆、古迹与文化内容'];
+    }
+    if (theme === 'nature') {
+      return ['优先选择公园、山水与景观类景区', '更强调户外视野与自然体验'];
+    }
+    if (theme === 'relaxation') {
+      return ['减少高密度打卡', '优先选择更适合慢游停留的景区'];
+    }
+    if (theme === 'personalized') {
+      return [`已结合兴趣画像：${selectedInterests.join('、') || '综合偏好'}`, '标签变化会直接改变景区评分和路线分配'];
+    }
+    return ['综合热度、评分与主题要素进行平衡推荐', '适合作为默认城市旅行日程'];
+  }
+
   private async getTopAttractions(limit: number = 10): Promise<ScenicArea[]> {
     const scenicAreaRepository = getScenicAreaRepository();
     const areas = await scenicAreaRepository.find({

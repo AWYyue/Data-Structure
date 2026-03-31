@@ -23,6 +23,85 @@ export interface RecommendationExplanation {
   totalScore: number;
 }
 
+export type CityTravelTheme =
+  | 'comprehensive'
+  | 'foodie'
+  | 'photographer'
+  | 'culture'
+  | 'nature'
+  | 'relaxation'
+  | 'personalized';
+
+export interface CityDestinationOption {
+  cityLabel: string;
+  scenicCount: number;
+  averageRating: number;
+  averagePopularity: number;
+  center: { latitude: number; longitude: number };
+  coverImageUrl: string;
+  coverImageTheme: string;
+  featuredScenicAreas: Array<{
+    id: string;
+    name: string;
+    category: string;
+    latitude: number | null;
+    longitude: number | null;
+    averageRating: number;
+    popularity: number;
+  }>;
+}
+
+export interface CityItineraryStop {
+  id: string;
+  scenicAreaId: string;
+  scenicAreaName: string;
+  day: number;
+  order: number;
+  latitude: number;
+  longitude: number;
+  averageRating: number;
+  popularity: number;
+  coverImageUrl: string;
+  coverImageTheme: string;
+  cityLabel: string;
+  reason: string;
+  highlightTags: string[];
+}
+
+export interface CityItineraryDay {
+  day: number;
+  title: string;
+  estimatedDistanceKm: number;
+  estimatedTimeMinutes: number;
+  stops: CityItineraryStop[];
+}
+
+export interface CityItinerarySegment {
+  id: string;
+  day: number;
+  order: number;
+  fromStopId: string;
+  toStopId: string;
+  points: Array<{ latitude: number; longitude: number }>;
+  color: string;
+  label: string;
+}
+
+export interface CityTravelItinerary {
+  cityLabel: string;
+  theme: CityTravelTheme;
+  tripDays: number;
+  center: { latitude: number; longitude: number };
+  days: CityItineraryDay[];
+  segments: CityItinerarySegment[];
+  legend: Array<{ id: string; label: string; color: string }>;
+  summary: {
+    totalStops: number;
+    cityScenicCount: number;
+    variationSignals: string[];
+  };
+}
+
 export interface RecommendationService {
   getPopularityRanking: (limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
   getRatingRanking: (limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
@@ -32,6 +111,12 @@ export interface RecommendationService {
   getIncrementalRecommendations: (limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
   getExplorationRecommendations: (limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
   getSurpriseRecommendations: (limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
+  getCityDestinationOptions: (limit?: number) => Promise<{ success: boolean; data: CityDestinationOption[] }>;
+  generateCityTravelItinerary: (payload: {
+    cityLabel: string;
+    theme: CityTravelTheme;
+    tripDays: number;
+  }) => Promise<{ success: boolean; data: CityTravelItinerary }>;
   getRecommendationExplanation: (itemId: string) => Promise<{ success: boolean; data: RecommendationExplanation }>;
   learnUserBehavior: (itemId: string, behaviorType: string, category?: string, rating?: number) => Promise<{ success: boolean; message: string }>;
 }
@@ -67,6 +152,14 @@ const recommendationService: RecommendationService = {
 
   getSurpriseRecommendations: async (limit = 5) => {
     return api.get(`/recommendations/surprise?limit=${limit}`);
+  },
+
+  getCityDestinationOptions: async (limit = 12) => {
+    return api.get(`/recommendations/cities?limit=${limit}`);
+  },
+
+  generateCityTravelItinerary: async (payload) => {
+    return api.post('/recommendations/city-itinerary', payload);
   },
 
   getRecommendationExplanation: async (itemId) => {

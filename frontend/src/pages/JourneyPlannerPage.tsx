@@ -5,898 +5,987 @@ import {
   Button,
   Card,
   Col,
-  Divider,
   Empty,
-  List,
-  Progress,
   Radio,
   Row,
   Space,
   Spin,
-  Switch,
   Tag,
   Typography,
 } from 'antd';
-import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
+import MapComponent from '../components/MapComponent';
 import PremiumPageHero from '../components/PremiumPageHero';
-import recommendationService, { ScenicArea } from '../services/recommendationService';
-import pathPlanningService from '../services/pathPlanningService';
+import recommendationService, {
+  CityDestinationOption,
+  CityItineraryDay,
+  CityItineraryStop,
+  CityTravelItinerary,
+  CityTravelTheme,
+} from '../services/recommendationService';
 import { useAppDispatch, useAppSelector } from '../store';
 import { updateInterests } from '../store/slices/userSlice';
-import {
-  getJourneyContext,
-  JourneyPlanStop,
-  saveJourneyContext,
-  StoredJourneyContext,
-} from '../utils/journeyContext';
 import { resolveErrorMessage } from '../utils/errorMessage';
+import { haversineDistanceKm } from '../utils/geoUtils';
 
-const { Title, Text, Paragraph } = Typography;
+const { Title, Paragraph, Text } = Typography;
 
 const cardStyle: React.CSSProperties = {
-  borderRadius: 20,
+  borderRadius: 24,
+  boxShadow: '0 18px 40px rgba(15,23,42,0.08)',
   height: '100%',
-  boxShadow: '0 14px 34px rgba(15,23,42,0.08)',
 };
 
-const summaryCardStyle: React.CSSProperties = {
-  background: 'linear-gradient(180deg, #f8fbff 0%, #f5f8fc 100%)',
-  borderRadius: 16,
-  minHeight: 108,
-};
+const DEFAULT_DAY_START_MINUTES = 9 * 60 + 30;
+const STOPS_PER_DAY_OPTIONS = [
+  { label: '2 个景点', value: 2 },
+  { label: '3 个景点', value: 3 },
+  { label: '4 个景点', value: 4 },
+];
+const TRIP_DAY_OPTIONS = [
+  { label: '1 天', value: 1 },
+  { label: '2 天', value: 2 },
+  { label: '3 天', value: 3 },
+];
+const DAY_COLOR_FALLBACK = ['#2563eb', '#16a34a', '#f59e0b', '#8b5cf6'];
 
 const interestOptions = [
-  { value: 'foodie', label: '美食爱好者', desc: '优先推荐地方风味、特色餐饮和适合顺路打卡的美食点位。' },
-  { value: 'photographer', label: '摄影打卡党', desc: '优先推荐高出片景点、黄金机位和适合拍照的游览时段。' },
-  { value: 'cultureEnthusiast', label: '历史文化控', desc: '优先推荐古迹、人文场馆和讲解价值更高的景点。' },
-  { value: 'natureLover', label: '自然风光派', desc: '优先推荐绿地、水岸、公园与观景路线。' },
-  { value: 'sportsEnthusiast', label: '活力运动型', desc: '优先推荐步行强度更高、探索感更强的游玩节奏。' },
-  { value: 'relaxationSeeker', label: '轻松休闲型', desc: '优先推荐停留更舒适、休息点更多的安排。' },
-  { value: 'socialSharer', label: '社交分享型', desc: '优先推荐热点活动、互动区域和更适合分享的目的地。' },
+  { value: 'foodie', label: '美食', description: '优先强化美食密度、餐饮丰富度和适合边逛边吃的路线。' },
+  { value: 'photographer', label: '拍照', description: '优先强化高出片景点、观景顺序和拍摄节奏。' },
+  { value: 'cultureEnthusiast', label: '人文', description: '优先强化古迹、博物馆、历史街区等文化内容。' },
+  { value: 'natureLover', label: '自然', description: '优先强化公园、水岸、山景和户外视野。' },
+  { value: 'relaxationSeeker', label: '慢游', description: '优先降低赶路感，让每日停留更舒展。' },
+  { value: 'sportsEnthusiast', label: '活力', description: '优先强化探索感和串联步行的连贯性。' },
+  { value: 'socialSharer', label: '分享', description: '优先强化热门打卡点和适合分享的体验节点。' },
 ];
 
-type DayPlanItem = JourneyPlanStop;
+const themeOptions: Array<{ value: CityTravelTheme; label: string; summary: string }> = [
+  { value: 'comprehensive', label: '综合', summary: '平衡热度、评分、体验密度和城市代表性，适合作为默认方案。' },
+  { value: 'foodie', label: '美食', summary: '优先安排餐饮资源更丰富、适合逛吃的景点与街区。' },
+  { value: 'photographer', label: '拍照', summary: '优先安排更容易出片、顺序更适合拍摄的景点。' },
+  { value: 'culture', label: '人文', summary: '优先安排历史文化、古迹和博物馆类景点。' },
+  { value: 'nature', label: '自然', summary: '优先安排公园、湖景、山水和户外景观。' },
+  { value: 'relaxation', label: '慢游', summary: '优先安排节奏更舒缓、停留更舒服的路线。' },
+  { value: 'personalized', label: '个性化', summary: '读取你保存的兴趣画像，动态重排每日景点顺序。' },
+];
 
-type RecommendationMode = 'personalized' | 'exploration' | 'surprise' | 'popular';
+const themeLabelMap = Object.fromEntries(themeOptions.map((item) => [item.value, item.label])) as Record<
+  CityTravelTheme,
+  string
+>;
 
-type RecommendationExplanation = {
-  factors: Array<{ name: string; weight: number; explanation: string }>;
-  totalScore: number;
+const formatClock = (minutes: number) => {
+  const normalized = Math.max(0, Math.round(minutes));
+  const hour = Math.floor(normalized / 60);
+  const minute = normalized % 60;
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
 };
 
-const normalizeStringArray = (value: unknown): string[] => {
-  if (Array.isArray(value)) {
-    return value.map((item) => String(item).trim()).filter(Boolean);
+const formatMinutes = (minutes: number) => {
+  const safeMinutes = Math.max(0, Math.round(Number(minutes || 0)));
+  const hours = Math.floor(safeMinutes / 60);
+  const remaining = safeMinutes % 60;
+  if (hours <= 0) return `${remaining} 分钟`;
+  if (remaining <= 0) return `${hours} 小时`;
+  return `${hours} 小时 ${remaining} 分钟`;
+};
+
+const formatDistance = (distanceKm: number) => `${Number(distanceKm || 0).toFixed(1)} km`;
+
+const estimateStopStayMinutes = (stop: CityItineraryStop) => {
+  const joinedTags = (stop.highlightTags || []).join('|');
+  let stayMinutes = 78;
+
+  if (/文化|博物馆|古迹|历史/.test(joinedTags)) stayMinutes += 26;
+  if (/美食|夜市|小吃|餐饮/.test(joinedTags)) stayMinutes += 18;
+  if (/自然|公园|湖|山|风景/.test(joinedTags)) stayMinutes += 22;
+  if (stop.popularity >= 15000) stayMinutes += 12;
+  if (stop.averageRating >= 4.6) stayMinutes += 8;
+
+  return Math.min(140, Math.max(60, Math.round(stayMinutes)));
+};
+
+const estimateTransferMinutes = (from: CityItineraryStop, to: CityItineraryStop) => {
+  const distanceKm = haversineDistanceKm(from.latitude, from.longitude, to.latitude, to.longitude);
+  return Math.max(18, Math.round(distanceKm * 5.5));
+};
+
+const estimateDisplayedDistanceKm = (stops: CityItineraryStop[]) => {
+  if (stops.length < 2) return 0;
+  let total = 0;
+  for (let index = 0; index < stops.length - 1; index += 1) {
+    total += haversineDistanceKm(
+      stops[index].latitude,
+      stops[index].longitude,
+      stops[index + 1].latitude,
+      stops[index + 1].longitude,
+    );
+  }
+  return Number((total * 1.18).toFixed(1));
+};
+
+const buildDayTimeline = (day: CityItineraryDay) => {
+  const schedule = new Map<string, { startMinutes: number; startLabel: string }>();
+  if (!day.stops.length) {
+    return {
+      schedule,
+      startLabel: '--:--',
+      endLabel: '--:--',
+      totalMinutes: 0,
+    };
   }
 
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    if (!trimmed || trimmed === '[object Object]') {
-      return [];
+  let cursor = DEFAULT_DAY_START_MINUTES;
+  day.stops.forEach((stop, index) => {
+    schedule.set(stop.id, { startMinutes: cursor, startLabel: formatClock(cursor) });
+    cursor += estimateStopStayMinutes(stop);
+    if (index < day.stops.length - 1) {
+      cursor += estimateTransferMinutes(stop, day.stops[index + 1]);
     }
-
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed)) {
-        return parsed.map((item) => String(item).trim()).filter(Boolean);
-      }
-    } catch {
-      // fall back to delimiter parsing
-    }
-
-    return trimmed
-      .replace(/^\[|\]$/g, '')
-      .split(/[,\uFF0C|]/)
-      .map((item) => item.trim().replace(/^["']|["']$/g, ''))
-      .filter(Boolean);
-  }
-
-  return [];
-};
-
-const normalizeDayPlanItems = (value: unknown): DayPlanItem[] => {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value
-    .map((item) => {
-      const source = item as Partial<DayPlanItem>;
-      if (!source?.attractionId || !source.name || !source.arrivalTime) {
-        return null;
-      }
-
-      return {
-        attractionId: String(source.attractionId),
-        name: String(source.name),
-        arrivalTime: String(source.arrivalTime),
-        stayDuration: Number(source.stayDuration || 0),
-        isMustVisit: Boolean(source.isMustVisit),
-      };
-    })
-    .filter((item): item is DayPlanItem => Boolean(item));
-};
-
-const intensityMeta: Record<'low' | 'medium' | 'high', { label: string; pace: string; description: string }> = {
-  low: {
-    label: '轻松',
-    pace: '舒缓游玩',
-    description: '景点更少、停留更久，适合边逛边休息的慢节奏体验。',
-  },
-  medium: {
-    label: '标准',
-    pace: '平衡节奏',
-    description: '兼顾热门景点、步行强度和整体时长，适合作为常规一日游方案。',
-  },
-  high: {
-    label: '高强度',
-    pace: '高效打卡',
-    description: '覆盖更多点位，适合希望高效率游览、集中完成打卡的安排。',
-  },
-};
-
-const modeLabelMap: Record<RecommendationMode, string> = {
-  personalized: '个性化推荐',
-  exploration: '探索模式',
-  surprise: '惊喜推荐',
-  popular: '热门推荐',
-};
-
-const transportByIntensity: Record<'low' | 'medium' | 'high', 'walk' | 'bicycle' | 'electric_cart'> = {
-  low: 'walk',
-  medium: 'bicycle',
-  high: 'electric_cart',
-};
-
-const formatTime = (time: string) =>
-  new Date(time).toLocaleTimeString('zh-CN', {
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
   });
 
-const resolveItemReason = (mode: RecommendationMode, item: ScenicArea): string => {
-  if (mode === 'exploration') {
-    return `探索模式会优先拉高你较少尝试的类型，本次偏向 ${item.category || '综合景区'}。`;
+  return {
+    schedule,
+    startLabel: formatClock(DEFAULT_DAY_START_MINUTES),
+    endLabel: formatClock(cursor),
+    totalMinutes: cursor - DEFAULT_DAY_START_MINUTES,
+  };
+};
+
+const buildPresentedItinerary = (
+  source: CityTravelItinerary,
+  requestedTripDays: number,
+  stopsPerDay: number,
+): CityTravelItinerary => {
+  const flatStops = source.days
+    .flatMap((day) => [...day.stops].sort((left, right) => left.order - right.order))
+    .sort((left, right) => left.day - right.day || left.order - right.order);
+
+  if (!flatStops.length) return source;
+
+  const displayedStops = flatStops.slice(0, Math.min(flatStops.length, requestedTripDays * stopsPerDay));
+  const activeDayCount = Math.max(1, Math.min(requestedTripDays, Math.ceil(displayedStops.length / stopsPerDay)));
+  const legends = Array.from({ length: activeDayCount }, (_, index) => ({
+    id: `day-${index + 1}`,
+    label: `第 ${index + 1} 天`,
+    color: source.legend[index]?.color || DAY_COLOR_FALLBACK[index % DAY_COLOR_FALLBACK.length],
+  }));
+
+  const dayGroups: CityItineraryStop[][] = [];
+  let cursor = 0;
+  let remainingStops = displayedStops.length;
+
+  for (let dayIndex = 0; dayIndex < activeDayCount; dayIndex += 1) {
+    const daysLeft = activeDayCount - dayIndex;
+    const count = Math.min(stopsPerDay, Math.ceil(remainingStops / daysLeft));
+    const nextGroup = displayedStops.slice(cursor, cursor + count);
+    cursor += count;
+    remainingStops -= nextGroup.length;
+    dayGroups.push(nextGroup);
   }
-  if (mode === 'surprise') {
-    return '惊喜推荐会适度跳出既有偏好，优先展示你可能会喜欢但平时不常选的目的地。';
-  }
-  if (mode === 'popular') {
-    return '当前结果主要依据景区热度、评分和游客反馈综合排序。';
-  }
-  return '系统已按你的兴趣偏好进行匹配，优先推荐契合度更高的景区。';
+
+  const originalSegmentMap = new Map(source.segments.map((segment) => [`${segment.fromStopId}->${segment.toStopId}`, segment]));
+
+  const days = dayGroups.map((group, dayIndex) => {
+    const normalizedStops = group.map((stop, stopIndex) => ({
+      ...stop,
+      day: dayIndex + 1,
+      order: stopIndex + 1,
+    }));
+    const timeline = buildDayTimeline({
+      day: dayIndex + 1,
+      title: `第 ${dayIndex + 1} 天`,
+      estimatedDistanceKm: 0,
+      estimatedTimeMinutes: 0,
+      stops: normalizedStops,
+    });
+
+    return {
+      day: dayIndex + 1,
+      title: `第 ${dayIndex + 1} 天`,
+      estimatedDistanceKm: estimateDisplayedDistanceKm(normalizedStops),
+      estimatedTimeMinutes: timeline.totalMinutes,
+      stops: normalizedStops,
+    };
+  });
+
+  const segments = days.flatMap((day) =>
+    day.stops.slice(0, -1).map((stop, index) => {
+      const nextStop = day.stops[index + 1];
+      const matchedSegment = originalSegmentMap.get(`${stop.id}->${nextStop.id}`);
+      return {
+        id: `day-${day.day}-segment-${index + 1}`,
+        day: day.day,
+        order: index + 1,
+        fromStopId: stop.id,
+        toStopId: nextStop.id,
+        points:
+          matchedSegment?.points?.length
+            ? matchedSegment.points
+            : [
+                { latitude: stop.latitude, longitude: stop.longitude },
+                { latitude: nextStop.latitude, longitude: nextStop.longitude },
+              ],
+        color: legends[day.day - 1]?.color || DAY_COLOR_FALLBACK[(day.day - 1) % DAY_COLOR_FALLBACK.length],
+        label: `第 ${day.day} 天第 ${index + 1} 段`,
+      };
+    }),
+  );
+
+  return {
+    ...source,
+    tripDays: activeDayCount,
+    days,
+    segments,
+    legend: legends,
+    summary: {
+      ...source.summary,
+      totalStops: displayedStops.length,
+      variationSignals: [
+        ...source.summary.variationSignals,
+        `已按“每日 ${stopsPerDay} 个景点”重排行程节奏`,
+      ],
+    },
+  };
 };
 
 const JourneyPlannerPage: React.FC = () => {
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
   const dispatch = useAppDispatch();
   const { message } = App.useApp();
   const { user } = useAppSelector((state) => state.user);
-  const restoredJourneyRef = useRef<StoredJourneyContext | null>(getJourneyContext());
-  const hasAppliedStoredJourneyRef = useRef(false);
-  const previousScenicIdRef = useRef<string | null>(null);
 
   const [selectedInterests, setSelectedInterests] = useState<string[]>([]);
   const [savingInterests, setSavingInterests] = useState(false);
+  const [cityOptions, setCityOptions] = useState<CityDestinationOption[]>([]);
+  const [loadingCities, setLoadingCities] = useState(false);
+  const [cityLoadError, setCityLoadError] = useState<string | null>(null);
+  const [selectedCityLabel, setSelectedCityLabel] = useState('');
+  const [selectedTheme, setSelectedTheme] = useState<CityTravelTheme>('comprehensive');
+  const [tripDays, setTripDays] = useState(2);
+  const [stopsPerDay, setStopsPerDay] = useState(3);
+  const [rawItinerary, setRawItinerary] = useState<CityTravelItinerary | null>(null);
+  const [generating, setGenerating] = useState(false);
+  const [generationError, setGenerationError] = useState<string | null>(null);
+  const [selectedDay, setSelectedDay] = useState<number | 'all'>(1);
+  const [selectedStopId, setSelectedStopId] = useState<string | null>(null);
 
-  const [loadingRecommendations, setLoadingRecommendations] = useState(false);
-  const [recommendations, setRecommendations] = useState<ScenicArea[]>([]);
-  const [selectedScenic, setSelectedScenic] = useState<ScenicArea | null>(null);
-  const [explorationEnabled, setExplorationEnabled] = useState(false);
-  const [surpriseEnabled, setSurpriseEnabled] = useState(false);
-  const [recommendationSourceHint, setRecommendationSourceHint] = useState('');
-  const [loadingExplanation, setLoadingExplanation] = useState(false);
-  const [recommendationExplanation, setRecommendationExplanation] = useState<RecommendationExplanation | null>(null);
-  const [explanationError, setExplanationError] = useState<string | null>(null);
-
-  const [intensity, setIntensity] = useState<'low' | 'medium' | 'high'>('medium');
-  const [planning, setPlanning] = useState(false);
-  const [dayPlan, setDayPlan] = useState<DayPlanItem[]>([]);
-  const [dayPlanDistance, setDayPlanDistance] = useState(0);
-  const [dayPlanTime, setDayPlanTime] = useState(0);
-  const [routingIndex, setRoutingIndex] = useState<number | null>(null);
-
-  const resumeSegmentIndex = Math.max(0, Number(searchParams.get('resumeSegment') || '0'));
-  const resumeSource = (searchParams.get('source') || '').trim();
-
-  const hasInterests = selectedInterests.length > 0;
-
-  const recommendationMode = useMemo<RecommendationMode>(() => {
-    if (surpriseEnabled) {
-      return 'surprise';
-    }
-    if (explorationEnabled) {
-      return 'exploration';
-    }
-    if (user && hasInterests) {
-      return 'personalized';
-    }
-    return 'popular';
-  }, [explorationEnabled, hasInterests, surpriseEnabled, user]);
-
-  const selectedInterestDescriptions = useMemo(
-    () => interestOptions.filter((item) => selectedInterests.includes(item.value)),
-    [selectedInterests],
-  );
-
-  const explanationFactors = useMemo(
-    () => (Array.isArray(recommendationExplanation?.factors) ? recommendationExplanation.factors : []),
-    [recommendationExplanation],
-  );
-
-  const dayPlanSummary = useMemo(() => {
-    const mustVisitCount = dayPlan.filter((item) => item.isMustVisit).length;
-    const totalStayMinutes = dayPlan.reduce((sum, item) => sum + Number(item.stayDuration || 0), 0);
-    return {
-      attractionCount: dayPlan.length,
-      mustVisitCount,
-      totalStayMinutes,
-    };
-  }, [dayPlan]);
-
-  const resumeAlert = useMemo(() => {
-    if (resumeSource !== 'path-planning' || dayPlan.length < 2) {
-      return null;
-    }
-
-    const from = dayPlan[resumeSegmentIndex];
-    const to = dayPlan[resumeSegmentIndex + 1];
-    if (!from || !to) {
-      return null;
-    }
-
-    return {
-      title: `你刚从第 ${resumeSegmentIndex + 1} 段导航返回`,
-      description: `${from.name} -> ${to.name}。你可以继续查看整天计划，或直接重新进入这一段导航。`,
-    };
-  }, [dayPlan, resumeSegmentIndex, resumeSource]);
+  const latestRequestIdRef = useRef(0);
 
   useEffect(() => {
-    if (!resumeAlert) {
-      return;
+    setSelectedInterests(Array.isArray(user?.interests) ? user.interests.map((item) => String(item)) : []);
+    if (Array.isArray(user?.interests) && user.interests.length > 0) {
+      setSelectedTheme('personalized');
     }
-
-    message.success(resumeAlert.title);
-  }, [message, resumeAlert]);
-
-  useEffect(() => {
-    setSelectedInterests(normalizeStringArray(user?.interests));
   }, [user?.id, user?.interests]);
 
   useEffect(() => {
-    const stored = restoredJourneyRef.current;
-    if (!stored || hasAppliedStoredJourneyRef.current) {
-      return;
-    }
+    const loadCities = async () => {
+      setLoadingCities(true);
+      setCityLoadError(null);
 
-    hasAppliedStoredJourneyRef.current = true;
-    setIntensity(stored.intensity);
-    setDayPlan(stored.plan);
-    setDayPlanDistance(stored.totalDistance);
-    setDayPlanTime(stored.totalTime);
+      try {
+        const response = await recommendationService.getCityDestinationOptions(12);
+        const options = response.data || [];
+        setCityOptions(options);
+        setSelectedCityLabel((current) => current || options[0]?.cityLabel || '');
+      } catch (error: unknown) {
+        setCityOptions([]);
+        setCityLoadError(resolveErrorMessage(error, '加载旅游城市失败，请稍后重试。'));
+      } finally {
+        setLoadingCities(false);
+      }
+    };
+
+    void loadCities();
   }, []);
 
-  useEffect(() => {
-    const nextScenicId = selectedScenic?.id || null;
-    if (
-      previousScenicIdRef.current &&
-      nextScenicId &&
-      previousScenicIdRef.current !== nextScenicId
-    ) {
-      setDayPlan([]);
-      setDayPlanDistance(0);
-      setDayPlanTime(0);
+  const selectedCity = useMemo(
+    () => cityOptions.find((item) => item.cityLabel === selectedCityLabel) || null,
+    [cityOptions, selectedCityLabel],
+  );
+
+  const selectedThemeMeta = useMemo(
+    () => themeOptions.find((item) => item.value === selectedTheme) || themeOptions[0],
+    [selectedTheme],
+  );
+
+  const displayedItinerary = useMemo(
+    () => (rawItinerary ? buildPresentedItinerary(rawItinerary, tripDays, stopsPerDay) : null),
+    [rawItinerary, tripDays, stopsPerDay],
+  );
+
+  const selectedDayData = useMemo(
+    () => displayedItinerary?.days.find((day) => day.day === selectedDay) || null,
+    [displayedItinerary, selectedDay],
+  );
+
+  const selectedStop = useMemo(() => {
+    if (!displayedItinerary || !selectedStopId) return null;
+    for (const day of displayedItinerary.days) {
+      const match = day.stops.find((stop) => stop.id === selectedStopId);
+      if (match) return match;
     }
-    previousScenicIdRef.current = nextScenicId;
-  }, [selectedScenic?.id]);
+    return null;
+  }, [displayedItinerary, selectedStopId]);
 
-  useEffect(() => {
-    const scenicAreaId = selectedScenic?.id || restoredJourneyRef.current?.scenicAreaId || null;
-    const scenicAreaName = selectedScenic?.name || restoredJourneyRef.current?.scenicAreaName || null;
-
-    if (!scenicAreaId && !dayPlan.length) {
-      return;
+  const dayTimelineMap = useMemo(() => {
+    if (!displayedItinerary) {
+      return new Map<number, ReturnType<typeof buildDayTimeline>>();
     }
+    return new Map(displayedItinerary.days.map((day) => [day.day, buildDayTimeline(day)]));
+  }, [displayedItinerary]);
 
-    saveJourneyContext({
-      scenicAreaId,
-      scenicAreaName,
-      intensity,
-      plan: dayPlan,
-      totalDistance: dayPlanDistance,
-      totalTime: dayPlanTime,
-      updatedAt: new Date().toISOString(),
-    });
-  }, [dayPlan, dayPlanDistance, dayPlanTime, intensity, selectedScenic]);
+  const heroMetrics = useMemo(
+    () => [
+      { label: '当前城市', value: displayedItinerary?.cityLabel || selectedCity?.cityLabel || '待选择' },
+      { label: '主题', value: themeLabelMap[displayedItinerary?.theme || selectedTheme] },
+      { label: '天数', value: displayedItinerary?.tripDays || tripDays, suffix: '天' },
+      { label: '景点数', value: displayedItinerary?.summary.totalStops || 0, suffix: '个' },
+    ],
+    [displayedItinerary, selectedCity, selectedTheme, tripDays],
+  );
+
+  const generateItinerary = async () => {
+    if (!selectedCityLabel) return;
+
+    const requestId = Date.now();
+    latestRequestIdRef.current = requestId;
+    setGenerating(true);
+    setGenerationError(null);
+
+    try {
+      const response = await recommendationService.generateCityTravelItinerary({
+        cityLabel: selectedCityLabel,
+        theme: selectedTheme,
+        tripDays,
+      });
+
+      if (latestRequestIdRef.current !== requestId) return;
+
+      setRawItinerary(response.data);
+      setSelectedDay(1);
+      setSelectedStopId(response.data.days[0]?.stops[0]?.id || null);
+    } catch (error: unknown) {
+      if (latestRequestIdRef.current !== requestId) return;
+      setRawItinerary(null);
+      setSelectedStopId(null);
+      setGenerationError(resolveErrorMessage(error, '生成城市旅游日程失败，请稍后重试。'));
+    } finally {
+      if (latestRequestIdRef.current === requestId) {
+        setGenerating(false);
+      }
+    }
+  };
 
   useEffect(() => {
-    const loadRecommendations = async () => {
-      setLoadingRecommendations(true);
-
-      try {
-        let list: ScenicArea[] = [];
-        let hint = '';
-
-        if (user) {
-          if (recommendationMode === 'personalized' && hasInterests) {
-            const personalized = await recommendationService.getPersonalizedRecommendations(8);
-            if (personalized.success) {
-              list = personalized.data || [];
-              hint = '已按你的兴趣偏好生成推荐，结果会随着后续行为持续校准。';
-            }
-          } else if (recommendationMode === 'exploration') {
-            const exploration = await recommendationService.getExplorationRecommendations(8);
-            if (exploration.success) {
-              list = exploration.data || [];
-              hint = '探索模式已开启：优先推荐你相对较少尝试的类型。';
-            }
-          } else if (recommendationMode === 'surprise') {
-            const surprise = await recommendationService.getSurpriseRecommendations(8);
-            if (surprise.success) {
-              list = surprise.data || [];
-              hint = '惊喜推荐已开启：本次会优先给你一些跳出常规偏好的选择。';
-            }
-          }
-        }
-
-        if (list.length === 0) {
-          const fallback = await recommendationService.getPopularityRanking(8);
-          if (fallback.success) {
-            list = fallback.data || [];
-            if (!user) {
-              hint = '当前未登录，先展示公共热门推荐。';
-            } else if (!hasInterests) {
-              hint = '你还没有保存兴趣偏好，当前先展示热门推荐。';
-            } else {
-              hint = '当前展示热门推荐，可随时切换推荐策略。';
-            }
-          }
-        }
-
-        setRecommendationSourceHint(hint);
-        setRecommendations(list);
-        setSelectedScenic((current) => {
-          if (current && list.some((item) => item.id === current.id)) {
-            return current;
-          }
-
-          const restoredScenicId = restoredJourneyRef.current?.scenicAreaId;
-          if (restoredScenicId) {
-            const restoredMatch = list.find((item) => item.id === restoredScenicId);
-            if (restoredMatch) {
-              return restoredMatch;
-            }
-          }
-
-          return list[0] || null;
-        });
-      } catch {
-        setRecommendations([]);
-        setSelectedScenic(null);
-        setRecommendationSourceHint('推荐服务暂时不可用，请稍后再试。');
-        message.error('加载景区推荐失败，请稍后重试。');
-      } finally {
-        setLoadingRecommendations(false);
-      }
-    };
-
-    void loadRecommendations();
-  }, [hasInterests, message, recommendationMode, user]);
+    if (!selectedCityLabel) return;
+    void generateItinerary();
+  }, [selectedCityLabel, selectedTheme, tripDays]);
 
   useEffect(() => {
-    const loadRecommendationExplanation = async () => {
-      if (!selectedScenic || !user) {
-        setRecommendationExplanation(null);
-        setExplanationError(null);
-        return;
-      }
-
-      setLoadingExplanation(true);
-      setExplanationError(null);
-
-      try {
-        const response = await recommendationService.getRecommendationExplanation(selectedScenic.id);
-        setRecommendationExplanation(response.data || null);
-      } catch {
-        setRecommendationExplanation(null);
-        setExplanationError('暂时无法获取这条推荐的解释说明。');
-      } finally {
-        setLoadingExplanation(false);
-      }
-    };
-
-    void loadRecommendationExplanation();
-  }, [selectedScenic, user]);
+    if (!displayedItinerary) return;
+    if (selectedDay !== 'all' && !displayedItinerary.days.some((day) => day.day === selectedDay)) {
+      setSelectedDay(displayedItinerary.days[0]?.day || 'all');
+    }
+    if (selectedStopId && !displayedItinerary.days.some((day) => day.stops.some((stop) => stop.id === selectedStopId))) {
+      setSelectedStopId(displayedItinerary.days[0]?.stops[0]?.id || null);
+    }
+  }, [displayedItinerary, selectedDay, selectedStopId]);
 
   const handleSaveInterests = async () => {
-    if (!hasInterests) {
-      message.warning('请至少选择一个兴趣偏好。');
-      return;
-    }
-
-    setSavingInterests(true);
     try {
+      setSavingInterests(true);
       await dispatch(updateInterests(selectedInterests)).unwrap();
-      message.success('兴趣偏好已保存，推荐结果已同步更新。');
-    } catch {
-      message.error('保存兴趣偏好失败，请稍后重试。');
+      message.success('兴趣画像已更新');
+    } catch (error: unknown) {
+      message.error(resolveErrorMessage(error, '保存兴趣画像失败'));
     } finally {
       setSavingInterests(false);
     }
   };
 
-  const handleGenerateDayPlan = async () => {
-    if (!user) {
-      message.warning('请先登录后再生成一日计划。');
-      return;
-    }
-
-    if (!selectedScenic) {
-      message.warning('请先从推荐结果中选择一个景区。');
-      return;
-    }
-
-    setPlanning(true);
-    try {
-      const response = await pathPlanningService.generateDayPlan(selectedScenic.id, user.id, intensity);
-      const normalizedPlan = normalizeDayPlanItems(response?.data?.plan);
-      setDayPlan(normalizedPlan);
-      setDayPlanDistance(Number(response?.data?.totalDistance || 0));
-      setDayPlanTime(Number(response?.data?.totalTime || 0));
-
-      if (normalizedPlan.length > 0) {
-        message.success(`已为你生成 ${normalizedPlan.length} 个停留点的一日计划。`);
-      } else {
-        message.warning('已完成规划，但当前景区暂无可展示的计划节点。');
-      }
-    } catch (error: unknown) {
-      message.error(resolveErrorMessage(error, '生成一日计划失败，请稍后重试。'));
-    } finally {
-      setPlanning(false);
+  const handleSelectDay = (day: number | 'all') => {
+    setSelectedDay(day);
+    if (day === 'all') return;
+    const nextDay = displayedItinerary?.days.find((item) => item.day === day);
+    if (nextDay?.stops[0]) {
+      setSelectedStopId(nextDay.stops[0].id);
     }
   };
 
-  const handleNavigatePlanSegment = async (index: number) => {
-    if (index < 0 || index >= dayPlan.length - 1) {
-      return;
-    }
+  const handleOpenDayNavigation = (day: CityTravelItinerary['days'][number]) => {
+    if (!day.stops.length) return;
 
-    const from = dayPlan[index];
-    const to = dayPlan[index + 1];
+    const payload = day.stops.map((stop) => ({
+      id: stop.scenicAreaId,
+      name: stop.scenicAreaName,
+      latitude: stop.latitude,
+      longitude: stop.longitude,
+    }));
 
-    setRoutingIndex(index);
-    try {
-      saveJourneyContext({
-        scenicAreaId: selectedScenic?.id || null,
-        scenicAreaName: selectedScenic?.name || null,
-        intensity,
-        plan: dayPlan,
-        totalDistance: dayPlanDistance,
-        totalTime: dayPlanTime,
-        updatedAt: new Date().toISOString(),
+    const query = new URLSearchParams({
+      mode: 'multi',
+      source: 'city-itinerary',
+      strategy: 'shortest_time',
+      transportations: 'walk',
+      autoPlan: '1',
+      dayLabel: day.title,
+      cityLabel: displayedItinerary?.cityLabel || selectedCityLabel,
+      dayRoutePayload: JSON.stringify(payload),
+    });
+
+    navigate(`/path-planning?${query.toString()}`);
+  };
+
+  const mapMarkers = useMemo(() => {
+    if (!displayedItinerary) return [];
+
+    return displayedItinerary.days.flatMap((day) => {
+      const dayColor = displayedItinerary.legend.find((item) => item.id === `day-${day.day}`)?.color || '#2563eb';
+      const dayTimeline = dayTimelineMap.get(day.day);
+
+      return day.stops.map((stop, index) => {
+        const isCurrentDay = selectedDay === 'all' || selectedDay === day.day;
+        const isSelectedStop = selectedStopId === stop.id;
+        const stopSchedule = dayTimeline?.schedule.get(stop.id);
+        const nextStop = day.stops[index + 1];
+        const previousStop = day.stops[index - 1];
+        const selectedTooltipHtml = `
+          <div style="
+            background:rgba(255,255,255,0.96);
+            color:#0f172a;
+            border:1px solid rgba(37,99,235,0.16);
+            box-shadow:0 12px 24px rgba(15,23,42,0.14);
+            border-radius:14px;
+            padding:8px 10px;
+            min-width:150px;
+            max-width:176px;
+          ">
+            <div style="font-size:10px;font-weight:700;color:${dayColor};margin-bottom:4px;">${stopSchedule?.startLabel || '--:--'} 开始游览</div>
+            <div style="font-size:13px;font-weight:800;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${stop.scenicAreaName}</div>
+            <div style="font-size:10px;color:#64748b;margin-top:3px;">第 ${day.day} 天 · 第 ${stop.order} 站 · 评分 ${stop.averageRating.toFixed(1)}</div>
+          </div>
+        `;
+        const popupHtml = `
+          <div style="min-width:270px;">
+            <div style="display:flex;gap:12px;">
+              <div style="
+                width:78px;
+                height:78px;
+                border-radius:14px;
+                background-image:linear-gradient(180deg, rgba(15,23,42,0.06), rgba(15,23,42,0.28)), url(${stop.coverImageUrl});
+                background-size:cover;
+                background-position:center;
+                flex-shrink:0;
+              "></div>
+              <div style="min-width:0;">
+                <div style="font-size:12px;color:#64748b;margin-bottom:4px;">第 ${day.day} 天 · 第 ${stop.order} 站</div>
+                <div style="font-size:16px;font-weight:800;color:#0f172a;line-height:1.35;">${stop.scenicAreaName}</div>
+                <div style="margin-top:6px;color:#2563eb;font-size:12px;font-weight:700;">开始游览：${stopSchedule?.startLabel || '--:--'}</div>
+              </div>
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;">
+              <span style="padding:4px 8px;border-radius:999px;background:#eff6ff;color:#2563eb;font-size:11px;font-weight:700;">评分 ${stop.averageRating.toFixed(1)}</span>
+              <span style="padding:4px 8px;border-radius:999px;background:#fff7ed;color:#ea580c;font-size:11px;font-weight:700;">热度 ${Math.round(stop.popularity)}</span>
+              ${previousStop ? `<span style="padding:4px 8px;border-radius:999px;background:#ecfeff;color:#0f766e;font-size:11px;font-weight:700;">上一站 ${previousStop.scenicAreaName}</span>` : ''}
+              ${nextStop ? `<span style="padding:4px 8px;border-radius:999px;background:#f5f3ff;color:#7c3aed;font-size:11px;font-weight:700;">下一站 ${nextStop.scenicAreaName}</span>` : ''}
+            </div>
+            <div style="margin-top:10px;color:#475569;line-height:1.55;">${stop.reason}</div>
+          </div>
+        `;
+
+        return {
+          id: stop.id,
+          position: [stop.latitude, stop.longitude] as [number, number],
+          title: popupHtml,
+          disablePopup: true,
+          type: 'waypoint' as const,
+          imageUrl: stop.coverImageUrl,
+          badgeLabel: `${stop.day}-${stop.order}`,
+          tooltipPermanent: isSelectedStop,
+          tooltipDirection: 'top' as const,
+          tooltipOffset: [0, -22] as [number, number],
+          tooltipHtml: isSelectedStop ? selectedTooltipHtml : undefined,
+          borderColor: isSelectedStop ? '#0f172a' : '#ffffff',
+          size: isSelectedStop ? 68 : isCurrentDay ? 54 : 46,
+          opacity: isSelectedStop ? 1 : isCurrentDay ? 0.98 : 0.42,
+          zIndexOffset: isSelectedStop ? 520 : isCurrentDay ? 300 : 140,
+          dimmed: !isCurrentDay,
+          shadowColor: dayColor,
+        };
       });
+    });
+  }, [dayTimelineMap, displayedItinerary, selectedDay, selectedStopId]);
 
-      const [fromNodeResp, toNodeResp] = await Promise.all([
-        pathPlanningService.findNearestNodeByAttraction(from.attractionId),
-        pathPlanningService.findNearestNodeByAttraction(to.attractionId),
-      ]);
+  const mapSegments = useMemo(() => {
+    if (!displayedItinerary) return [];
+    return displayedItinerary.segments.map((segment) => {
+      const isActive = selectedDay === 'all' ? true : segment.day === selectedDay;
+      return {
+        id: segment.id,
+        points: segment.points.map((point) => [point.latitude, point.longitude] as [number, number]),
+        color: segment.color,
+        isActive,
+        opacity: selectedDay === 'all' ? 0.84 : isActive ? 0.96 : 0.12,
+        weight: selectedDay === 'all' ? 5.6 : isActive ? 7.4 : 2.2,
+        title: `${segment.label}`,
+      };
+    });
+  }, [displayedItinerary, selectedDay]);
 
-      const transport = transportByIntensity[intensity];
-      const query = new URLSearchParams({
-        startNodeId: fromNodeResp.data.nodeId,
-        endNodeId: toNodeResp.data.nodeId,
-        transportation: transport,
-        startName: from.name,
-        endName: to.name,
-        scenicAreaId: selectedScenic?.id || '',
-        scenicName: selectedScenic?.name || '',
-        segmentIndex: String(index),
-        segmentCount: String(Math.max(dayPlan.length - 1, 0)),
-        source: 'journey',
-      });
+  const mapLegendItems = useMemo(
+    () =>
+      displayedItinerary?.legend.map((item) => ({
+        id: item.id,
+        label: item.label,
+        color: item.color,
+      })) || [],
+    [displayedItinerary],
+  );
 
-      navigate(`/path-planning?${query.toString()}`);
-    } catch (error: unknown) {
-      message.error(resolveErrorMessage(error, '生成导航失败，请稍后重试。'));
-    } finally {
-      setRoutingIndex(null);
+  const mapFocusPoints = useMemo(() => {
+    if (!displayedItinerary) return [];
+    if (selectedStop) {
+      return [[selectedStop.latitude, selectedStop.longitude] as [number, number]];
     }
-  };
-
-  const openPathPlanning = () => {
-    const query = new URLSearchParams();
-    if (selectedScenic?.id) {
-      query.set('scenicAreaId', selectedScenic.id);
-      query.set('scenicName', selectedScenic.name);
-      query.set('source', 'journey');
+    if (selectedDayData) {
+      return selectedDayData.stops.map((stop) => [stop.latitude, stop.longitude] as [number, number]);
     }
-    navigate(query.toString() ? `/path-planning?${query.toString()}` : '/path-planning');
-  };
-
-  const openQuery = () => {
-    const query = new URLSearchParams({ mode: 'scenic' });
-    if (selectedScenic?.id) {
-      query.set('scenicAreaId', selectedScenic.id);
-      query.set('scenicName', selectedScenic.name);
-    }
-    navigate(`/query?${query.toString()}`);
-  };
-
-  const openFood = () => {
-    if (selectedScenic?.id) {
-      navigate(`/food-recommendation/${selectedScenic.id}`);
-      return;
-    }
-    navigate('/food-recommendation');
-  };
+    return displayedItinerary.days.flatMap((day) => day.stops.map((stop) => [stop.latitude, stop.longitude] as [number, number]));
+  }, [displayedItinerary, selectedDayData, selectedStop]);
 
   return (
-    <div style={{ padding: 8, maxWidth: 1280, margin: '0 auto' }}>
+    <div style={{ padding: 8, maxWidth: 1440, margin: '0 auto' }}>
       <PremiumPageHero
-        title="智能行程助手"
-        description="按照“兴趣采集 -> 景区推荐 -> 一日计划 -> 分段导航”的流程，把推荐、规划和执行串成更完整的一条龙体验。"
-        tags={['兴趣建模', '推荐解释', '一日计划', '导航联动']}
+        title="智能行程"
+        description="先选旅游城市，再切换美食、拍照、人文、自然或个性化标签，系统会重新生成真正会变化的城市多日路线。"
         accent="teal"
-        metrics={[
-          { label: '当前策略', value: modeLabelMap[recommendationMode] },
-          { label: '已选兴趣', value: selectedInterests.length, suffix: '项' },
-          { label: '推荐景区', value: recommendations.length, suffix: '个' },
-          { label: '计划状态', value: dayPlan.length > 0 ? '已生成' : '待生成' },
-        ]}
+        eyebrow="城市日程总览"
+        coverImageUrl={selectedCity?.coverImageUrl}
+        coverLabel={selectedCity?.coverImageTheme}
+        tags={['城市级路线', '多日安排', '地图总览', '详细导航接力']}
+        metrics={heroMetrics}
       />
 
       <Row gutter={[16, 16]}>
         <Col xs={24} xl={8}>
           <Card variant="borderless" style={cardStyle}>
             <Title level={4} style={{ marginTop: 0 }}>
-              1. 兴趣画像
+              兴趣画像
             </Title>
-            <Paragraph type="secondary" style={{ marginBottom: 10 }}>
-              先告诉系统你的偏好，后续推荐、节奏和出行建议都会更贴近你的游玩方式。
-            </Paragraph>
-
+            <Paragraph type="secondary">保存兴趣标签后，选择“个性化”主题时会直接按你的偏好重新排列城市路线。</Paragraph>
             <Space wrap size={8}>
-              {interestOptions.map((item) => {
-                const checked = selectedInterests.includes(item.value);
-                return (
-                  <Tag.CheckableTag
-                    key={item.value}
-                    checked={checked}
-                    onChange={(active) =>
-                      setSelectedInterests((current) =>
-                        active ? [...new Set([...current, item.value])] : current.filter((value) => value !== item.value),
-                      )
-                    }
-                  >
-                    {item.label}
-                  </Tag.CheckableTag>
-                );
-              })}
+              {interestOptions.map((item) => (
+                <Tag.CheckableTag
+                  key={item.value}
+                  checked={selectedInterests.includes(item.value)}
+                  onChange={(checked) =>
+                    setSelectedInterests((current) =>
+                      checked ? [...new Set([...current, item.value])] : current.filter((value) => value !== item.value),
+                    )
+                  }
+                >
+                  {item.label}
+                </Tag.CheckableTag>
+              ))}
             </Space>
 
-            <List
-              style={{ marginTop: 12 }}
-              size="small"
-              dataSource={selectedInterestDescriptions}
-              locale={{ emptyText: '已选兴趣会显示在这里。' }}
-              renderItem={(item) => <List.Item>{item.desc}</List.Item>}
-            />
+            <div style={{ marginTop: 14, display: 'grid', gap: 10 }}>
+              {selectedInterests.length > 0 ? (
+                interestOptions
+                  .filter((item) => selectedInterests.includes(item.value))
+                  .map((item) => (
+                    <div
+                      key={item.value}
+                      style={{
+                        padding: '10px 12px',
+                        borderRadius: 14,
+                        background: '#f8fafc',
+                        border: '1px solid rgba(148,163,184,0.22)',
+                      }}
+                    >
+                      <Text strong>{item.label}</Text>
+                      <div style={{ color: '#64748b', marginTop: 4 }}>{item.description}</div>
+                    </div>
+                  ))
+              ) : (
+                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="先选一些兴趣标签，个性化路线才会更明显。" />
+              )}
+            </div>
 
-            <Button block type="primary" onClick={handleSaveInterests} loading={savingInterests}>
-              保存兴趣偏好
+            <Button type="primary" block loading={savingInterests} onClick={handleSaveInterests} style={{ marginTop: 16 }}>
+              保存兴趣画像
             </Button>
           </Card>
         </Col>
 
-        <Col xs={24} xl={8}>
+        <Col xs={24} xl={16}>
           <Card variant="borderless" style={cardStyle}>
             <Title level={4} style={{ marginTop: 0 }}>
-              2. 目的地推荐
+              行程设定
             </Title>
+            <Paragraph type="secondary">这里直接生成城市级多日路线，并且可以按“每天去几个景点”重排出更合理的节奏。</Paragraph>
 
-            <Space wrap style={{ marginBottom: 10 }}>
-              <Text type="secondary">探索模式</Text>
-              <Switch
-                checked={explorationEnabled}
-                onChange={(checked) => {
-                  setExplorationEnabled(checked);
-                  if (checked) {
-                    setSurpriseEnabled(false);
-                  }
-                }}
-              />
-              <Text type="secondary">惊喜推荐</Text>
-              <Switch
-                checked={surpriseEnabled}
-                onChange={(checked) => {
-                  setSurpriseEnabled(checked);
-                  if (checked) {
-                    setExplorationEnabled(false);
-                  }
-                }}
-              />
-            </Space>
-
-            <Space wrap style={{ marginBottom: 12 }}>
-              <Tag color="blue">当前策略：{modeLabelMap[recommendationMode]}</Tag>
-            </Space>
-
-            {!hasInterests ? (
-              <Alert type="warning" showIcon message="你还没有保存兴趣偏好，当前先展示热门推荐。" style={{ marginBottom: 12 }} />
-            ) : null}
-
-            {recommendationSourceHint ? (
-              <Alert type="info" showIcon message={recommendationSourceHint} style={{ marginBottom: 12 }} />
-            ) : null}
-
-            {loadingRecommendations ? (
-              <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}>
-                <Spin />
-              </div>
-            ) : recommendations.length === 0 ? (
-              <Empty description="暂无推荐结果" />
-            ) : (
-              <List
-                size="small"
-                dataSource={recommendations}
-                renderItem={(item) => (
-                  <List.Item
-                    onClick={() => setSelectedScenic(item)}
-                    style={{
-                      cursor: 'pointer',
-                      borderRadius: 14,
-                      marginBottom: 8,
-                      padding: '12px 14px',
-                      background:
-                        selectedScenic?.id === item.id
-                          ? 'linear-gradient(120deg, rgba(37,99,235,0.12), rgba(14,116,144,0.08))'
-                          : '#f8fafc',
-                      border:
-                        selectedScenic?.id === item.id
-                          ? '1px solid rgba(37,99,235,0.36)'
-                          : '1px solid transparent',
-                    }}
-                  >
-                    <Space direction="vertical" size={4}>
-                      <Text strong>{item.name}</Text>
-                      <Space wrap size={6}>
-                        <Tag color="blue">{item.category || '景区'}</Tag>
-                        <Tag color="green">评分 {item.averageRating ?? item.rating ?? 0}</Tag>
-                        <Tag color="orange">热度 {item.popularity ?? item.visitorCount ?? 0}</Tag>
-                      </Space>
-                      <Text type="secondary" style={{ fontSize: 12 }}>
-                        {resolveItemReason(recommendationMode, item)}
-                      </Text>
-                    </Space>
-                  </List.Item>
-                )}
-              />
-            )}
-
-            <Divider style={{ margin: '14px 0 10px' }} />
-            <Title level={5} style={{ marginTop: 0, marginBottom: 8 }}>
-              推荐理由解释
-            </Title>
-
-            {!user ? (
-              <Text type="secondary">登录后可查看个性化推荐背后的原因说明。</Text>
-            ) : loadingExplanation ? (
-              <div style={{ display: 'flex', justifyContent: 'center', padding: 12 }}>
-                <Spin size="small" />
-              </div>
-            ) : explanationError ? (
-              <Alert type="warning" showIcon message={explanationError} />
-            ) : recommendationExplanation && explanationFactors.length > 0 ? (
-              <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                {explanationFactors.map((factor) => {
-                  const total = recommendationExplanation.totalScore || 0;
-                  const percent = total > 0 ? Math.min(100, Math.max(0, (factor.weight / total) * 100)) : 0;
-
+            <div style={{ marginBottom: 16 }}>
+              <Text strong>主题标签</Text>
+              <div style={{ marginTop: 10, display: 'grid', gap: 10 }}>
+                {themeOptions.map((item) => {
+                  const active = item.value === selectedTheme;
                   return (
-                    <div key={factor.name}>
-                      <Space style={{ width: '100%', justifyContent: 'space-between' }}>
-                        <Text strong>{factor.name}</Text>
-                        <Text type="secondary">{percent.toFixed(0)}%</Text>
-                      </Space>
-                      <Progress percent={Number(percent.toFixed(0))} size="small" showInfo={false} />
-                      <Text type="secondary" style={{ fontSize: 12 }}>
-                        {factor.explanation}
-                      </Text>
+                    <div
+                      key={item.value}
+                      onClick={() => setSelectedTheme(item.value)}
+                      style={{
+                        cursor: 'pointer',
+                        borderRadius: 18,
+                        padding: '14px 16px',
+                        border: active ? '1px solid rgba(37,99,235,0.38)' : '1px solid rgba(148,163,184,0.18)',
+                        background: active ? 'linear-gradient(135deg, rgba(37,99,235,0.08), rgba(13,148,136,0.05))' : '#ffffff',
+                      }}
+                    >
+                      <Text strong>{item.label}</Text>
+                      <div style={{ color: '#64748b', marginTop: 8 }}>{item.summary}</div>
                     </div>
                   );
                 })}
-              </Space>
-            ) : (
-              <Text type="secondary">选择推荐景区后，这里会展示推荐理由。</Text>
-            )}
-          </Card>
-        </Col>
-
-        <Col xs={24} xl={8}>
-          <Card variant="borderless" style={cardStyle}>
-            <Title level={4} style={{ marginTop: 0 }}>
-              3. 一日计划
-            </Title>
-            <Paragraph type="secondary" style={{ marginBottom: 8 }}>
-              选中推荐景区后，一键生成可执行的一日计划，并可直接进入分段导航。
-            </Paragraph>
-
-            <Space direction="vertical" style={{ width: '100%' }} size={12}>
-              <Text>
-                当前目的地：
-                <Text strong>{selectedScenic ? ` ${selectedScenic.name}` : ' 未选择景区'}</Text>
-              </Text>
-
-              <Alert
-                type="info"
-                showIcon
-                message={`当前节奏：${intensityMeta[intensity].label} · ${intensityMeta[intensity].pace}`}
-                description={intensityMeta[intensity].description}
-              />
-
-              <Radio.Group
-                value={intensity}
-                onChange={(event) => setIntensity(event.target.value)}
-                options={[
-                  { label: '轻松', value: 'low' },
-                  { label: '标准', value: 'medium' },
-                  { label: '高强度', value: 'high' },
-                ]}
-                optionType="button"
-                buttonStyle="solid"
-              />
-
-              <Space wrap>
-                <Button type="primary" onClick={handleGenerateDayPlan} loading={planning}>
-                  生成一日计划
-                </Button>
-                <Button
-                  onClick={() => handleNavigatePlanSegment(0)}
-                  disabled={dayPlan.length < 2}
-                  loading={routingIndex === 0}
-                >
-                  一键导航首段
-                </Button>
-              </Space>
-            </Space>
-
-            {dayPlan.length > 0 ? (
-              <div style={{ marginTop: 16 }}>
-                <Row gutter={[10, 10]} style={{ marginBottom: 10 }}>
-                  <Col span={8}>
-                    <Card variant="borderless" style={summaryCardStyle}>
-                      <Text type="secondary" style={{ fontSize: 12 }}>
-                        景点数量
-                      </Text>
-                      <div style={{ fontSize: 26, fontWeight: 700, color: '#0f172a', marginTop: 4 }}>
-                        {dayPlanSummary.attractionCount}
-                      </div>
-                    </Card>
-                  </Col>
-                  <Col span={8}>
-                    <Card variant="borderless" style={summaryCardStyle}>
-                      <Text type="secondary" style={{ fontSize: 12 }}>
-                        必去点位
-                      </Text>
-                      <div style={{ fontSize: 26, fontWeight: 700, color: '#0f172a', marginTop: 4 }}>
-                        {dayPlanSummary.mustVisitCount}
-                      </div>
-                    </Card>
-                  </Col>
-                  <Col span={8}>
-                    <Card variant="borderless" style={summaryCardStyle}>
-                      <Text type="secondary" style={{ fontSize: 12 }}>
-                        停留时长
-                      </Text>
-                      <div style={{ fontSize: 26, fontWeight: 700, color: '#0f172a', marginTop: 4 }}>
-                        {dayPlanSummary.totalStayMinutes}
-                        <span style={{ fontSize: 14, marginLeft: 4, color: '#64748b' }}>分钟</span>
-                      </div>
-                    </Card>
-                  </Col>
-                </Row>
-
-                <Space wrap style={{ marginBottom: 10 }}>
-                  <Tag color="geekblue">总里程 {dayPlanDistance.toFixed(1)} 米</Tag>
-                  <Tag color="purple">总耗时 {dayPlanTime.toFixed(1)} 分钟</Tag>
-                  <Tag color="cyan">建议方式 {intensityMeta[intensity].label}</Tag>
-                </Space>
-
-                <List
-                  style={{ marginTop: 10 }}
-                  size="small"
-                  dataSource={dayPlan}
-                  renderItem={(item, index) => (
-                    <List.Item
-                      style={{
-                        padding: '14px 12px',
-                        borderRadius: 14,
-                        marginBottom: 8,
-                        background: '#f8fafc',
-                      }}
-                      actions={
-                        index < dayPlan.length - 1
-                          ? [
-                              <Button
-                                key={`${item.attractionId}-nav`}
-                                size="small"
-                                type="link"
-                                onClick={() => handleNavigatePlanSegment(index)}
-                                loading={routingIndex === index}
-                              >
-                                导航到下一站
-                              </Button>,
-                            ]
-                          : undefined
-                      }
-                    >
-                      <Space align="start" size={12}>
-                        <div
-                          style={{
-                            width: 30,
-                            height: 30,
-                            borderRadius: 999,
-                            background: '#1d4ed8',
-                            color: '#fff',
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            fontWeight: 700,
-                            flexShrink: 0,
-                            marginTop: 2,
-                          }}
-                        >
-                          {index + 1}
-                        </div>
-                        <Space direction="vertical" size={4}>
-                          <Space wrap size={6}>
-                            <Text strong>
-                              {formatTime(item.arrivalTime)} · {item.name}
-                            </Text>
-                            {item.isMustVisit ? <Tag color="red">必去</Tag> : null}
-                          </Space>
-                          <Text type="secondary">建议停留 {item.stayDuration} 分钟</Text>
-                        </Space>
-                      </Space>
-                    </List.Item>
-                  )}
-                />
               </div>
-            ) : (
-              <Empty
-                style={{ marginTop: 18 }}
-                description="生成后将在这里展示完整的一日游节奏、停留时长和分段导航入口。"
-              />
-            )}
+            </div>
+
+            <Row gutter={[12, 12]}>
+              <Col xs={24} md={12}>
+                <div style={{ padding: 14, borderRadius: 18, background: '#f8fafc', border: '1px solid rgba(148,163,184,0.16)' }}>
+                  <Text strong>旅行天数</Text>
+                  <div style={{ marginTop: 12 }}>
+                    <Radio.Group
+                      options={TRIP_DAY_OPTIONS}
+                      optionType="button"
+                      buttonStyle="solid"
+                      value={tripDays}
+                      onChange={(event) => setTripDays(Number(event.target.value))}
+                    />
+                  </div>
+                </div>
+              </Col>
+              <Col xs={24} md={12}>
+                <div style={{ padding: 14, borderRadius: 18, background: '#f8fafc', border: '1px solid rgba(148,163,184,0.16)' }}>
+                  <Text strong>每日景点数</Text>
+                  <div style={{ marginTop: 12 }}>
+                    <Radio.Group
+                      options={STOPS_PER_DAY_OPTIONS}
+                      optionType="button"
+                      buttonStyle="solid"
+                      value={stopsPerDay}
+                      onChange={(event) => setStopsPerDay(Number(event.target.value))}
+                    />
+                  </div>
+                </div>
+              </Col>
+            </Row>
+
+            <Alert
+              showIcon
+              type={selectedTheme === 'personalized' ? 'warning' : 'success'}
+              style={{ marginTop: 16, borderRadius: 16 }}
+              message={`当前策略：${selectedThemeMeta.label}`}
+              description={`当前按 ${tripDays} 天行程、每日 ${stopsPerDay} 个景点重排行程，时间会按城市内换乘与停留重新估算。`}
+            />
           </Card>
         </Col>
       </Row>
 
-      <Card
-        variant="borderless"
-        style={{ borderRadius: 20, marginTop: 16, boxShadow: '0 14px 34px rgba(15,23,42,0.08)' }}
-      >
+      <Card variant="borderless" style={{ ...cardStyle, marginTop: 16 }}>
         <Title level={4} style={{ marginTop: 0 }}>
-          4. 下一步执行
+          目的城市
         </Title>
-        <Space wrap>
-          <Button type="primary" onClick={openPathPlanning}>
-            去户外路径规划
-          </Button>
-          <Button onClick={() => navigate('/indoor-navigation')}>去室内导航</Button>
-          <Button onClick={openFood} disabled={!selectedScenic}>
-            去美食推荐
-          </Button>
-          <Button onClick={openQuery}>去景点查询</Button>
-          <Button onClick={() => navigate('/social')}>去社交互动</Button>
-          <Button onClick={() => navigate('/diary')}>去旅行日记</Button>
-        </Space>
-        <Paragraph type="secondary" style={{ marginTop: 10, marginBottom: 0 }}>
-          如果你想先从榜单浏览，也可以直接返回 <Link to="/">首页</Link>。
-        </Paragraph>
+        <Paragraph type="secondary">先选旅游城市，系统会以这个城市内的多个景区作为节点，生成真正可用的多日路线。</Paragraph>
+        {cityLoadError ? <Alert showIcon type="error" style={{ marginBottom: 14 }} message={cityLoadError} /> : null}
+
+        {loadingCities ? (
+          <div style={{ padding: 32, display: 'flex', justifyContent: 'center' }}>
+            <Spin />
+          </div>
+        ) : cityOptions.length === 0 ? (
+          <Empty description="暂时没有可用的城市数据。" />
+        ) : (
+          <Row gutter={[12, 12]}>
+            {cityOptions.map((city) => {
+              const active = city.cityLabel === selectedCityLabel;
+              return (
+                <Col xs={24} md={12} xl={8} key={city.cityLabel}>
+                  <div
+                    onClick={() => setSelectedCityLabel(city.cityLabel)}
+                    style={{
+                      cursor: 'pointer',
+                      borderRadius: 18,
+                      overflow: 'hidden',
+                      border: active ? '2px solid rgba(37,99,235,0.55)' : '1px solid rgba(148,163,184,0.16)',
+                      background: '#fff',
+                      boxShadow: active ? '0 14px 34px rgba(37,99,235,0.16)' : '0 8px 20px rgba(15,23,42,0.04)',
+                    }}
+                  >
+                    <div
+                      style={{
+                        minHeight: 132,
+                        padding: 16,
+                        color: '#fff',
+                        backgroundImage: `linear-gradient(180deg, rgba(15,23,42,0.10), rgba(15,23,42,0.52)), url(${city.coverImageUrl})`,
+                        backgroundSize: 'cover',
+                        backgroundPosition: 'center',
+                      }}
+                    >
+                      <Title level={4} style={{ color: '#fff', margin: 0 }}>
+                        {city.cityLabel}
+                      </Title>
+                      <div style={{ marginTop: 8, color: 'rgba(255,255,255,0.86)' }}>{city.coverImageTheme}</div>
+                    </div>
+                    <div style={{ padding: 14 }}>
+                      <Space wrap>
+                        <Tag color="blue">{city.scenicCount} 个景区</Tag>
+                        <Tag color="green">评分 {city.averageRating.toFixed(2)}</Tag>
+                        <Tag color="orange">热度 {Math.round(city.averagePopularity)}</Tag>
+                      </Space>
+                    </div>
+                  </div>
+                </Col>
+              );
+            })}
+          </Row>
+        )}
       </Card>
+
+      <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
+        <Col xs={24} xl={8}>
+          <Card
+            variant="borderless"
+            style={cardStyle}
+            extra={
+              <Button type="primary" loading={generating} onClick={() => void generateItinerary()}>
+                重新生成
+              </Button>
+            }
+          >
+            <Title level={4} style={{ marginTop: 0 }}>
+              多日旅游日程
+            </Title>
+            <Paragraph type="secondary">未选中的天数只显示摘要，当前选中的那一天才展开详细站点，让左侧更轻一点。</Paragraph>
+
+            {generationError ? <Alert showIcon type="error" message={generationError} style={{ marginBottom: 14 }} /> : null}
+
+            {generating && !displayedItinerary ? (
+              <div style={{ padding: 40, display: 'flex', justifyContent: 'center' }}>
+                <Spin />
+              </div>
+            ) : !displayedItinerary ? (
+              <Empty description="先选择城市，系统才能生成旅游日程。" />
+            ) : (
+              <div style={{ display: 'grid', gap: 14 }}>
+                <Alert
+                  type="info"
+                  showIcon
+                  message={`${displayedItinerary.cityLabel} · ${themeLabelMap[displayedItinerary.theme]} · ${displayedItinerary.tripDays} 天`}
+                  description={`共安排 ${displayedItinerary.summary.totalStops} 个景点，当前按每日 ${stopsPerDay} 个景点重排行程。`}
+                />
+
+                {displayedItinerary.days.map((day) => {
+                  const active = selectedDay === day.day;
+                  const timeline = dayTimelineMap.get(day.day);
+                  return (
+                    <div
+                      key={day.day}
+                      style={{
+                        borderRadius: 18,
+                        padding: 16,
+                        border: active ? '1px solid rgba(37,99,235,0.34)' : '1px solid rgba(148,163,184,0.18)',
+                        background: active ? 'linear-gradient(135deg, rgba(37,99,235,0.08), rgba(14,165,233,0.03))' : '#fff',
+                      }}
+                    >
+                      <Space wrap style={{ width: '100%', justifyContent: 'space-between' }}>
+                        <div
+                          onClick={() => handleSelectDay(day.day)}
+                          style={{ cursor: 'pointer', display: 'grid', gap: 8, flex: 1 }}
+                        >
+                          <Space wrap size={8}>
+                            <Tag color="blue">{day.title}</Tag>
+                            <Tag>{timeline ? `${timeline.startLabel} - ${timeline.endLabel}` : '--:--'}</Tag>
+                            <Tag>{formatDistance(day.estimatedDistanceKm)}</Tag>
+                            <Tag>{formatMinutes(day.estimatedTimeMinutes)}</Tag>
+                          </Space>
+                          <Text type="secondary">
+                            {active ? '点击下方景点卡可同步聚焦地图。' : `${day.stops.map((stop) => stop.scenicAreaName).join(' · ')}`}
+                          </Text>
+                        </div>
+                        <Space wrap>
+                          <Button size="small" type={active ? 'primary' : 'default'} onClick={() => handleSelectDay(day.day)}>
+                            聚焦本日
+                          </Button>
+                          <Button size="small" onClick={() => handleOpenDayNavigation(day)}>
+                            进入详细导航
+                          </Button>
+                        </Space>
+                      </Space>
+
+                      {active ? (
+                        <div style={{ marginTop: 12, display: 'grid', gap: 10 }}>
+                          {day.stops.map((stop) => {
+                            const isSelected = selectedStopId === stop.id;
+                            const startLabel = timeline?.schedule.get(stop.id)?.startLabel || '--:--';
+                            return (
+                              <div
+                                key={stop.id}
+                                onClick={() => {
+                                  setSelectedDay(day.day);
+                                  setSelectedStopId(stop.id);
+                                }}
+                                style={{
+                                  borderRadius: 16,
+                                  padding: '12px 14px',
+                                  cursor: 'pointer',
+                                  border: isSelected ? '1px solid rgba(37,99,235,0.34)' : '1px solid rgba(148,163,184,0.16)',
+                                  background: isSelected ? 'rgba(37,99,235,0.06)' : '#f8fafc',
+                                }}
+                              >
+                                <Space wrap style={{ width: '100%', justifyContent: 'space-between' }}>
+                                  <Space wrap size={8}>
+                                    <Tag color={isSelected ? 'blue' : 'default'}>{`第 ${stop.order} 站`}</Tag>
+                                    <Tag color="cyan">{startLabel}</Tag>
+                                    <Text strong>{stop.scenicAreaName}</Text>
+                                  </Space>
+                                  <Space wrap size={6}>
+                                    <Tag color="green">评分 {stop.averageRating.toFixed(1)}</Tag>
+                                    <Tag color="orange">热度 {Math.round(stop.popularity)}</Tag>
+                                  </Space>
+                                </Space>
+                                <div style={{ color: '#64748b', marginTop: 8 }}>{stop.reason}</div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <Space wrap size={6} style={{ marginTop: 12 }}>
+                          {day.stops.map((stop) => (
+                            <Tag key={stop.id}>{stop.scenicAreaName}</Tag>
+                          ))}
+                        </Space>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </Card>
+        </Col>
+
+        <Col xs={24} xl={16}>
+          <Card variant="borderless" style={cardStyle}>
+            <Space wrap style={{ width: '100%', justifyContent: 'space-between', marginBottom: 12 }}>
+              <div>
+                <Title level={4} style={{ margin: 0 }}>
+                  城市旅游路线总览图
+                </Title>
+                <Text type="secondary">点击地图或左侧景点后，会更近地聚焦这个景点，并弹出包含时间、评分、上下站点的近身信息卡。</Text>
+              </div>
+              <Space wrap>
+                <Tag color={selectedDay === 'all' ? 'blue' : 'default'} onClick={() => handleSelectDay('all')} style={{ cursor: 'pointer', paddingInline: 12 }}>
+                  全部天数
+                </Tag>
+                {(displayedItinerary?.days || []).map((day) => (
+                  <Tag
+                    key={day.day}
+                    color={selectedDay === day.day ? 'blue' : 'default'}
+                    onClick={() => handleSelectDay(day.day)}
+                    style={{ cursor: 'pointer', paddingInline: 12 }}
+                  >
+                    {day.title}
+                  </Tag>
+                ))}
+              </Space>
+            </Space>
+
+            {displayedItinerary ? (
+              <>
+                <Alert
+                  showIcon
+                  type="success"
+                  style={{ marginBottom: 14, borderRadius: 16 }}
+                  message={
+                    selectedStop
+                      ? `当前已聚焦：${selectedStop.scenicAreaName}`
+                      : selectedDay === 'all'
+                      ? '当前显示全部天数的总览路线'
+                      : `当前突出显示第 ${selectedDay} 天`
+                  }
+                  description={
+                    selectedStop
+                      ? '点击景点后，地图会更近地聚焦该点位，并把该站时间、评分、热度、上下站信息放到近身信息卡里。'
+                      : '非当前天数的路线会弱化；点击某个景点后会进一步缩放到该景点附近。'
+                  }
+                />
+                <MapComponent
+                  center={[displayedItinerary.center.latitude, displayedItinerary.center.longitude]}
+                  zoom={11}
+                  focusZoom={selectedStop ? 14 : selectedDayData ? 12 : 11}
+                  preferFocusPoints={Boolean(selectedStop || selectedDayData)}
+                  markers={mapMarkers}
+                  activeMarkerId={selectedStopId}
+                  onMarkerSelect={(marker) => {
+                    setSelectedStopId(marker.id);
+                    const match = displayedItinerary.days.find((day) => day.stops.some((stop) => stop.id === marker.id));
+                    if (match) setSelectedDay(match.day);
+                  }}
+                  congestionSegments={mapSegments}
+                  pathLegendItems={mapLegendItems}
+                  focusPoints={mapFocusPoints}
+                  showDirectionArrows
+                  baseMapMode="scenic"
+                />
+
+                {selectedStop ? (
+                  <div
+                    style={{
+                      marginTop: 16,
+                      borderRadius: 20,
+                      overflow: 'hidden',
+                      border: '1px solid rgba(148,163,184,0.18)',
+                      background: '#fff',
+                    }}
+                  >
+                    <div
+                      style={{
+                        minHeight: 176,
+                        padding: 18,
+                        color: '#fff',
+                        backgroundImage: `linear-gradient(180deg, rgba(15,23,42,0.16), rgba(15,23,42,0.56)), url(${selectedStop.coverImageUrl})`,
+                        backgroundSize: 'cover',
+                        backgroundPosition: 'center',
+                      }}
+                    >
+                      <Space direction="vertical" size={6}>
+                        <Tag color="blue">{`第 ${selectedStop.day} 天 · 第 ${selectedStop.order} 站`}</Tag>
+                        <Text style={{ color: '#fff', fontSize: 24, fontWeight: 700 }}>{selectedStop.scenicAreaName}</Text>
+                        <Text style={{ color: 'rgba(255,255,255,0.84)' }}>
+                          当前站点会在地图上自动放大、聚焦，并且把关键信息贴近景点显示。
+                        </Text>
+                      </Space>
+                    </div>
+                    <div style={{ padding: 16 }}>
+                      <Space wrap>
+                        <Tag color="cyan">开始游览 {dayTimelineMap.get(selectedStop.day)?.schedule.get(selectedStop.id)?.startLabel || '--:--'}</Tag>
+                        <Tag color="green">评分 {selectedStop.averageRating.toFixed(1)}</Tag>
+                        <Tag color="orange">热度 {Math.round(selectedStop.popularity)}</Tag>
+                        <Tag>{selectedStop.cityLabel}</Tag>
+                      </Space>
+                      <div style={{ color: '#475569', marginTop: 10 }}>{selectedStop.reason}</div>
+                    </div>
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <Empty description="生成日程后，这里会显示城市多日路线总览图。" />
+            )}
+          </Card>
+        </Col>
+      </Row>
     </div>
   );
 };
