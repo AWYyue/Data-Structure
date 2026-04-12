@@ -1,6 +1,7 @@
 import { Entity, PrimaryGeneratedColumn, Column, ManyToOne, OneToMany, CreateDateColumn, UpdateDateColumn } from 'typeorm';
 import { User } from './User';
 import { DiaryComment } from './DiaryComment';
+import { stringArrayJsonTransformer } from '../utils/stringArrayField';
 
 @Entity('diaries')
 export class Diary {
@@ -25,7 +26,7 @@ export class Diary {
   @Column({ type: 'date', nullable: true })
   visitDate: Date | null = null;
 
-  @Column({ type: 'text', array: true, nullable: true })
+  @Column({ type: 'text', nullable: true, transformer: stringArrayJsonTransformer })
   route: string[] = [];
 
   @Column({ type: 'integer', default: 0 })

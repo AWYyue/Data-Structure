@@ -10,6 +10,7 @@ import { ScenicArea as ScenicAreaEntity } from '../entities/ScenicArea';
 import { Trie } from '../algorithms/Trie';
 import { resolveScenicPresentation } from '../utils/scenicPresentation';
 import { haversineDistanceKm } from '../utils/geoUtils';
+import { normalizeStringArray } from '../utils/stringArrayField';
 
 interface ScenicArea {
   id: string;
@@ -188,7 +189,7 @@ export class QueryService {
       averageRating: entity.averageRating,
       reviewCount: entity.reviewCount,
       isShared: entity.isShared,
-      route: entity.route,
+      route: normalizeStringArray(entity.route),
     };
   }
 

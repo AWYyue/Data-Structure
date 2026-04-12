@@ -64,12 +64,12 @@ const createCommonOptions = () => {
 };
 
 const resolveSqliteDatabasePath = () => {
-  const configuredPath = process.env.SQLITE_DB_PATH || process.env.DB_PATH || './travel_system.db';
+  const backendRootDir = path.resolve(__dirname, '..', '..');
+  const configuredPath = process.env.SQLITE_DB_PATH || process.env.DB_PATH || path.join(backendRootDir, 'travel_system.db');
   if (path.isAbsolute(configuredPath)) {
     return configuredPath;
   }
 
-  const backendRootDir = path.resolve(__dirname, '..', '..');
   return path.resolve(backendRootDir, configuredPath);
 };
 

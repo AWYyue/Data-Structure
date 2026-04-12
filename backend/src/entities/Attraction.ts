@@ -1,5 +1,6 @@
 import { Entity, PrimaryGeneratedColumn, Column, ManyToOne, CreateDateColumn, UpdateDateColumn, Index } from 'typeorm';
 import { ScenicArea } from './ScenicArea';
+import { stringArrayJsonTransformer } from '../utils/stringArrayField';
 
 @Entity('attractions')
 @Index('IDX_ATTRACTION_SCENIC_AREA', ['scenicAreaId'])
@@ -46,7 +47,7 @@ export class Attraction {
   @Column({ type: 'decimal', precision: 3, scale: 2, default: 1.0 })
   congestionFactor: number = 1.0;
 
-  @Column({ type: 'text', array: true, nullable: true })
+  @Column({ type: 'text', nullable: true, transformer: stringArrayJsonTransformer })
   tags: string[] = [];
 
   @Column({ type: 'text', nullable: true })

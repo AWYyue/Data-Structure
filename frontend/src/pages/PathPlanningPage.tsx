@@ -336,7 +336,24 @@ const PathPlanningPage: React.FC = () => {
     returnToStart: false,
   });
 
-  const localOptions = useMemo(() => roadNetwork.nodes.map(nodeToOption), [roadNetwork.nodes]);
+  const scenicSelfOption = useMemo<SearchOption | null>(() => {
+    if (!scenicAreaId || !scenicAreaName) {
+      return null;
+    }
+
+    return {
+      value: scenicAreaId,
+      label: scenicAreaName,
+      placeName: scenicAreaName,
+      placeType: 'scenic_area',
+      scenicAreaId,
+    };
+  }, [scenicAreaId, scenicAreaName]);
+
+  const localOptions = useMemo(
+    () => (scenicSelfOption ? [scenicSelfOption, ...roadNetwork.nodes.map(nodeToOption)] : roadNetwork.nodes.map(nodeToOption)),
+    [roadNetwork.nodes, scenicSelfOption],
+  );
   const preferredLocalOptions = useMemo(
     () => [
       ...localOptions.filter((item) => item.placeType !== 'junction'),
@@ -785,6 +802,10 @@ const PathPlanningPage: React.FC = () => {
     const trimmed = input.trim();
     if (!trimmed) return null;
     if (selected && (selected.value === trimmed || selected.placeName === trimmed)) return selected;
+
+    if (scenicSelfOption && (trimmed === scenicSelfOption.placeName || trimmed === scenicSelfOption.label)) {
+      return scenicSelfOption;
+    }
 
     const localMatch = currentOptions.find((item) => item.placeName === trimmed || item.label === trimmed || item.value === trimmed);
     if (localMatch) return localMatch;

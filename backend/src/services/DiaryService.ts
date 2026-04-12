@@ -2,6 +2,7 @@ import { AppDataSource } from '../config/database';
 import { Diary } from '../entities/Diary';
 import { DiaryComment } from '../entities/DiaryComment';
 import { User } from '../entities/User';
+import { normalizeStringArray } from '../utils/stringArrayField';
 
 // 简单的Huffman压缩实现（用于演示）
 class HuffmanCompressor {
@@ -224,7 +225,7 @@ export class DiaryService {
         compressedContent: Buffer.from(compressedContent),
         destination: diaryData.destination,
         visitDate: diaryData.visitDate,
-        route: diaryData.route,
+        route: normalizeStringArray(diaryData.route),
         isShared: diaryData.isShared || false
       });
 
@@ -239,7 +240,7 @@ export class DiaryService {
         compressedContent: Buffer.from(compressedContent),
         destination: diaryData.destination,
         visitDate: diaryData.visitDate,
-        route: diaryData.route,
+        route: normalizeStringArray(diaryData.route),
         isShared: diaryData.isShared || false,
         reviewCount: 0,
         averageRating: 0,
@@ -341,6 +342,9 @@ export class DiaryService {
 
       // 更新其他字段
       Object.assign(diary, updateData);
+      if (updateData.route !== undefined) {
+        diary.route = normalizeStringArray(updateData.route);
+      }
 
       return await diaryRepository.save(diary);
     } else {
@@ -358,6 +362,9 @@ export class DiaryService {
 
       // 更新其他字段
       Object.assign(diary, updateData);
+      if (updateData.route !== undefined) {
+        diary.route = normalizeStringArray(updateData.route);
+      }
       diary.updatedAt = new Date();
 
       // 更新内存存储

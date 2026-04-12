@@ -5,6 +5,7 @@ import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 import { v4 as uuidv4 } from 'uuid';
+import { normalizeStringArray } from '../utils/stringArrayField';
 
 dotenv.config();
 
@@ -225,7 +226,7 @@ export class UserService {
       throw new Error('User not found');
     }
 
-    user.interests = interests;
+    user.interests = normalizeStringArray(interests);
 
     if (userRepository) {
       return await userRepository.save(user);

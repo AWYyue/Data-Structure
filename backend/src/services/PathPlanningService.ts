@@ -967,10 +967,6 @@ export class PathPlanningService {
     candidateNode: GraphNode,
     strategy: PathStrategy,
   ): number {
-    if (originalNode.type === 'scenic_area') {
-      return 0;
-    }
-
     if (originalNode.id === candidateNode.id) {
       return 0;
     }
@@ -1032,40 +1028,57 @@ export class PathPlanningService {
         scopedTransportations,
       );
 
-    if (scopedTransportations.length > 1 || scopedTransportations[0] === Transportation.WALK) {
-      return finalizeResponse(
-        await this.buildPathResponse(
-          resolvedStartNodeId,
-          resolvedEndNodeId,
-          parsedStrategy,
-          scopedTransportations,
-        ),
-      );
-    }
-
-    const shouldPreferDirectRoad =
-      scopedTransportations.includes(Transportation.BICYCLE) ||
-      scopedTransportations.includes(Transportation.ELECTRIC_CART);
+    const vehicleTransportations = scopedTransportations.filter(
+      (item) => item === Transportation.BICYCLE || item === Transportation.ELECTRIC_CART,
+    );
+    const shouldPreferDirectRoad = vehicleTransportations.length > 0;
 
     if (shouldPreferDirectRoad) {
+      const candidates: PathResponse[] = [];
+
       const hybridRoute = await this.tryBuildBestHybridRoute(
         resolvedStartNodeId,
         resolvedEndNodeId,
         scopedTransportations,
         parsedStrategy,
       );
-      if (hybridRoute) {
-        return finalizeResponse(hybridRoute);
+      if (hybridRoute?.segments?.length) {
+        candidates.push(hybridRoute);
       }
 
       const directRoadRoute = await this.tryBuildBestDirectRoadRoute(
         resolvedStartNodeId,
         resolvedEndNodeId,
-        scopedTransportations,
+        vehicleTransportations,
         parsedStrategy,
       );
-      if (directRoadRoute) {
-        return finalizeResponse(directRoadRoute);
+      if (directRoadRoute?.segments?.length) {
+        candidates.push(directRoadRoute);
+      }
+
+      if (scopedTransportations.includes(Transportation.WALK)) {
+        try {
+          const pureWalkRoute = await this.buildPathResponse(
+            resolvedStartNodeId,
+            resolvedEndNodeId,
+            parsedStrategy,
+            [Transportation.WALK],
+          );
+          if (pureWalkRoute.segments?.length) {
+            candidates.push(pureWalkRoute);
+          }
+        } catch {
+          // ignore pure-walk fallback failures and keep evaluating other candidates
+        }
+      }
+
+      if (candidates.length) {
+        candidates.sort((left, right) =>
+          parsedStrategy === PathStrategy.SHORTEST_DISTANCE
+            ? Number(left.distance || 0) - Number(right.distance || 0)
+            : Number(left.time || 0) - Number(right.time || 0),
+        );
+        return finalizeResponse(candidates[0]);
       }
     }
 

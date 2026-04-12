@@ -1,5 +1,6 @@
 import { Entity, PrimaryGeneratedColumn, Column, ManyToOne, CreateDateColumn, UpdateDateColumn, Index } from 'typeorm';
 import { Facility } from './Facility';
+import { stringArrayJsonTransformer } from '../utils/stringArrayField';
 
 @Entity('foods')
 @Index('IDX_FOOD_FACILITY', ['facilityId'])
@@ -34,7 +35,7 @@ export class Food {
   @Column({ type: 'integer', default: 0 })
   reviewCount: number = 0;
 
-  @Column({ type: 'text', array: true, nullable: true })
+  @Column({ type: 'text', nullable: true, transformer: stringArrayJsonTransformer })
   tags: string[] = [];
 
   @Column({ type: 'boolean', default: false })
