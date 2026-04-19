@@ -27,10 +27,28 @@ const initialState: QueryState = {
 
 export const searchScenicAreas = createAsyncThunk(
   'query/searchScenicAreas',
-  async ({ query, limit }: { query: string; limit?: number }, { rejectWithValue }) => {
+  async (
+    {
+      name,
+      categories,
+      minRating,
+      limit,
+    }: {
+      name?: string;
+      categories?: string[];
+      minRating?: number;
+      limit?: number;
+    },
+    { rejectWithValue },
+  ) => {
     const fallbackMessage = '搜索景区失败';
     try {
-      const response = await queryService.searchScenicAreas(query, limit);
+      const response = await queryService.searchScenicAreas({
+        name,
+        categories,
+        minRating,
+        limit,
+      });
       if (response.success) {
         return response.data;
       }

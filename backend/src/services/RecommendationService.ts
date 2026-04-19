@@ -147,6 +147,31 @@ export interface CityTravelItinerary {
   };
 }
 
+export interface AttractionRecommendationItem {
+  id: string;
+  name: string;
+  baseHeat: number;
+  averageRating: number;
+  tags: string[];
+  distanceKm: number;
+  scenicAreaId?: string;
+  category?: string;
+  type?: string;
+  latitude?: number | null;
+  longitude?: number | null;
+  sourceAttraction?: Attraction;
+}
+
+export interface RecommendationUserProfile {
+  id: string;
+  interestWeights: Record<string, number>;
+}
+
+export interface ScoredAttractionRecommendation extends AttractionRecommendationItem {
+  score: number;
+  tagMatchScore: number;
+}
+
 // 简单的最小堆实现
 class MinHeap<T> {
   private heap: T[];
@@ -234,6 +259,172 @@ export class RecommendationService {
 
   private presentScenicAreas<T extends ScenicArea>(areas: T[]): Array<T & ScenicPresentation> {
     return areas.map((area) => this.presentScenicArea(area));
+  }
+
+  buildRecommendationUserProfile(user: User): RecommendationUserProfile {
+    return {
+      id: user.id,
+      interestWeights: this.normalizeInterestWeights(user.interestWeights),
+    };
+  }
+
+  buildAttractionRecommendationItem(
+    attraction: Attraction,
+    distanceKm: number = 0,
+  ): AttractionRecommendationItem {
+    const baseHeat = this.resolveAttractionBaseHeat(attraction);
+    attraction.baseHeat = baseHeat;
+
+    return {
+      id: attraction.id,
+      name: attraction.name,
+      baseHeat,
+      averageRating: Number(attraction.averageRating || 0),
+      tags: this.normalizeAttractionTags(attraction),
+      distanceKm: Number.isFinite(distanceKm) && distanceKm >= 0 ? Number(distanceKm.toFixed(3)) : 0,
+      scenicAreaId: attraction.scenicAreaId,
+      category: attraction.category || '',
+      type: attraction.type || '',
+      latitude: attraction.latitude,
+      longitude: attraction.longitude,
+      sourceAttraction: attraction,
+    };
+  }
+
+  calculateScore(attraction: AttractionRecommendationItem, distanceKm: number = attraction.distanceKm): number {
+    const normalizedHeat = this.clamp((attraction.baseHeat - 2000) / 6000, 0, 1);
+    const normalizedRating = this.clamp(attraction.averageRating / 5, 0, 1);
+    const safeDistance = Number.isFinite(distanceKm) && distanceKm >= 0 ? distanceKm : 0;
+    const distanceScore = 1 / (1 + safeDistance);
+
+    const score = normalizedHeat * 0.4 + normalizedRating * 0.35 + distanceScore * 0.25;
+    return Number((score * 100).toFixed(4));
+  }
+
+  getTopKRecommendations(
+    attractions: AttractionRecommendationItem[],
+    k: number,
+    user: RecommendationUserProfile,
+  ): ScoredAttractionRecommendation[] {
+    if (!Array.isArray(attractions) || attractions.length === 0 || k <= 0) {
+      return [];
+    }
+
+    const safeK = Math.max(1, Math.floor(k));
+    const profile = {
+      id: user.id,
+      interestWeights: this.normalizeInterestWeights(user.interestWeights),
+    };
+    const minHeap = new MinHeap<{ score: number; tagMatchScore: number; item: AttractionRecommendationItem }>(
+      safeK,
+      (left, right) => left.score - right.score,
+    );
+
+    attractions.forEach((attraction) => {
+      const baseScore = this.calculateScore(attraction, attraction.distanceKm);
+      const tagMatchScore = this.calculateTagMatchScore(attraction.tags, profile.interestWeights);
+      const score = Number((baseScore + tagMatchScore * 20).toFixed(4));
+      minHeap.insert({ score, tagMatchScore, item: attraction });
+    });
+
+    return minHeap
+      .getTopK()
+      .map(({ item, score, tagMatchScore }) => ({
+        ...item,
+        score,
+        tagMatchScore,
+      }))
+      .sort(
+        (left, right) =>
+          right.score - left.score ||
+          right.tagMatchScore - left.tagMatchScore ||
+          right.baseHeat - left.baseHeat ||
+          right.averageRating - left.averageRating,
+      );
+  }
+
+  recommendByTags(
+    attractions: AttractionRecommendationItem[],
+    user: RecommendationUserProfile,
+    limit: number = 10,
+  ): ScoredAttractionRecommendation[] {
+    if (!Array.isArray(attractions) || attractions.length === 0 || limit <= 0) {
+      return [];
+    }
+
+    const profile = {
+      id: user.id,
+      interestWeights: this.normalizeInterestWeights(user.interestWeights),
+    };
+
+    const scored = attractions.map((attraction) => {
+      const tagMatchScore = this.calculateTagMatchScore(attraction.tags, profile.interestWeights);
+      const heatScore = this.clamp((attraction.baseHeat - 2000) / 6000, 0, 1);
+      return {
+        ...attraction,
+        tagMatchScore,
+        score: Number((tagMatchScore * 70 + heatScore * 30).toFixed(4)),
+      };
+    });
+
+    const matched = scored.filter((item) => item.tagMatchScore > 0);
+    const source = matched.length > 0 ? matched : scored;
+
+    return source
+      .sort(
+        (left, right) =>
+          right.tagMatchScore - left.tagMatchScore ||
+          right.baseHeat - left.baseHeat ||
+          right.averageRating - left.averageRating,
+      )
+      .slice(0, Math.max(1, Math.floor(limit)));
+  }
+
+  async getTopKAttractionRecommendations(
+    userId: string,
+    k: number = 10,
+    referencePoint?: { latitude: number; longitude: number },
+  ): Promise<ScoredAttractionRecommendation[]> {
+    const userRepository = getUserRepository();
+    const attractionRepository = getAttractionRepository();
+
+    const [user, attractions] = await Promise.all([
+      userRepository.findOne({ where: { id: userId } }),
+      attractionRepository.find({ take: 5000 }),
+    ]);
+
+    if (!user) {
+      throw new Error('User not found');
+    }
+
+    const mappedAttractions = attractions.map((attraction) =>
+      this.buildAttractionRecommendationItem(
+        attraction,
+        this.resolveAttractionDistanceKm(attraction, referencePoint),
+      ),
+    );
+
+    return this.getTopKRecommendations(mappedAttractions, k, this.buildRecommendationUserProfile(user));
+  }
+
+  async getTagBasedAttractionRecommendations(
+    userId: string,
+    limit: number = 10,
+  ): Promise<ScoredAttractionRecommendation[]> {
+    const userRepository = getUserRepository();
+    const attractionRepository = getAttractionRepository();
+
+    const [user, attractions] = await Promise.all([
+      userRepository.findOne({ where: { id: userId } }),
+      attractionRepository.find({ take: 5000 }),
+    ]);
+
+    if (!user) {
+      throw new Error('User not found');
+    }
+
+    const mappedAttractions = attractions.map((attraction) => this.buildAttractionRecommendationItem(attraction));
+    return this.recommendByTags(mappedAttractions, this.buildRecommendationUserProfile(user), limit);
   }
 
   // 热度榜
@@ -1439,6 +1630,81 @@ export class RecommendationService {
       return `${areaName} 与你的兴趣画像匹配更高，命中了 ${highlightTags.concat(selectedInterests).slice(0, 2).join('、')}。`;
     }
     return `${areaName} 在热度、评分和体验维度上更均衡，适合作为综合路线站点。`;
+  }
+
+  private normalizeInterestWeights(value: Record<string, number> | null | undefined) {
+    const normalized: Record<string, number> = {};
+    Object.entries(value || {}).forEach(([key, rawWeight]) => {
+      const normalizedKey = String(key).trim();
+      const numericWeight = Number(rawWeight);
+      if (!normalizedKey || !Number.isFinite(numericWeight)) {
+        return;
+      }
+      normalized[normalizedKey] = numericWeight;
+    });
+    return normalized;
+  }
+
+  private normalizeAttractionTags(attraction: Attraction): string[] {
+    const tags = [
+      ...(Array.isArray(attraction.tags) ? attraction.tags : []),
+      attraction.category || '',
+      attraction.type || '',
+    ]
+      .map((item) => String(item).trim())
+      .filter(Boolean);
+
+    return Array.from(new Set(tags));
+  }
+
+  private resolveAttractionBaseHeat(attraction: Attraction): number {
+    const hash = this.stableHash(`${attraction.id}:${attraction.name}:${attraction.category || ''}`);
+    return 2000 + (hash % 6001);
+  }
+
+  private calculateTagMatchScore(tags: string[], interestWeights: Record<string, number>): number {
+    if (!tags.length) {
+      return 0;
+    }
+
+    const normalizedInterestWeights = this.normalizeInterestWeights(interestWeights);
+    const weights = tags
+      .map((tag) => normalizedInterestWeights[String(tag).trim()])
+      .filter((value): value is number => Number.isFinite(value));
+
+    if (!weights.length) {
+      return 0;
+    }
+
+    const maxWeight = Math.max(...weights);
+    const averageWeight = weights.reduce((sum, value) => sum + value, 0) / weights.length;
+    return Number((maxWeight * 0.6 + averageWeight * 0.4).toFixed(4));
+  }
+
+  private resolveAttractionDistanceKm(
+    attraction: Attraction,
+    referencePoint?: { latitude: number; longitude: number },
+  ): number {
+    if (
+      referencePoint &&
+      Number.isFinite(Number(attraction.latitude)) &&
+      Number.isFinite(Number(attraction.longitude))
+    ) {
+      return Number(
+        this.haversineKm(
+          referencePoint.latitude,
+          referencePoint.longitude,
+          Number(attraction.latitude || 0),
+          Number(attraction.longitude || 0),
+        ).toFixed(3),
+      );
+    }
+
+    return 0;
+  }
+
+  private clamp(value: number, min: number, max: number) {
+    return Math.min(max, Math.max(min, value));
   }
 
   private keywordScore(text: string, keywords: string[]) {

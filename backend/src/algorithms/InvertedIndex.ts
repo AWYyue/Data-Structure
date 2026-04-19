@@ -127,8 +127,23 @@ export class InvertedIndex {
     }
     const lower = text.toLowerCase();
     const latin = lower.match(/[a-z0-9]+/g) ?? [];
-    const chinese = lower.match(/[\u4e00-\u9fa5]/g) ?? [];
-    return [...latin, ...chinese].filter((term) => term.length > 0);
+    const chineseSequences = lower.match(/[\u4e00-\u9fa5]+/g) ?? [];
+    const chineseTerms: string[] = [];
+
+    chineseSequences.forEach((sequence) => {
+      chineseTerms.push(sequence);
+      for (let i = 0; i < sequence.length; i += 1) {
+        chineseTerms.push(sequence[i]);
+        if (i + 1 < sequence.length) {
+          chineseTerms.push(sequence.slice(i, i + 2));
+        }
+        if (i + 2 < sequence.length) {
+          chineseTerms.push(sequence.slice(i, i + 3));
+        }
+      }
+    });
+
+    return [...latin, ...chineseTerms].filter((term) => term.length > 0);
   }
 }
 

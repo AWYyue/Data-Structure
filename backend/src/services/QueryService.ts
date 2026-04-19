@@ -97,6 +97,13 @@ interface RoadEdge {
   distance: number;
 }
 
+interface ScenicAreaQueryOptions {
+  name?: string;
+  categories?: string[];
+  minRating?: number;
+  limit?: number;
+}
+
 export class QueryService {
   private scenicTrie: Trie<ScenicArea> | null = null;
   private scenicSnapshot: ScenicArea[] = [];
@@ -193,6 +200,147 @@ export class QueryService {
     };
   }
 
+  private normalizeCategories(categories?: string[]): string[] {
+    return Array.from(
+      new Set(
+        (Array.isArray(categories) ? categories : [])
+          .map((item) => String(item).trim())
+          .filter(Boolean),
+      ),
+    );
+  }
+
+  private resolveScenicScore(item: ScenicArea): number {
+    const candidate = Number(item.averageRating ?? item.rating ?? 0);
+    return Number.isFinite(candidate) ? candidate : 0;
+  }
+
+  private resolveScenicHeat(item: ScenicArea): number {
+    const candidate = Number(item.visitorCount ?? item.popularity ?? 0);
+    return Number.isFinite(candidate) ? candidate : 0;
+  }
+
+  private sortScenicAreas(items: ScenicArea[]): ScenicArea[] {
+    return [...items].sort((left, right) => {
+      const scoreDiff = this.resolveScenicScore(right) - this.resolveScenicScore(left);
+      if (scoreDiff !== 0) {
+        return scoreDiff;
+      }
+
+      const heatDiff = this.resolveScenicHeat(right) - this.resolveScenicHeat(left);
+      if (heatDiff !== 0) {
+        return heatDiff;
+      }
+
+      return left.name.localeCompare(right.name, 'zh-CN');
+    });
+  }
+
+  private matchesScenicKeyword(item: ScenicArea, keyword: string): boolean {
+    const normalizedKeyword = keyword.trim().toLowerCase();
+    if (!normalizedKeyword) {
+      return true;
+    }
+
+    return [item.name, item.description, item.tags, item.category, item.cityLabel]
+      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      .some((value) => value.toLowerCase().includes(normalizedKeyword));
+  }
+
+  private scoreScenicSuggestion(item: ScenicArea, keyword: string): number {
+    const normalizedKeyword = keyword.trim().toLowerCase();
+    if (!normalizedKeyword) {
+      return 0;
+    }
+
+    const name = item.name.toLowerCase();
+    const category = (item.category || '').toLowerCase();
+    const tags = (item.tags || '').toLowerCase();
+    const description = (item.description || '').toLowerCase();
+    const cityLabel = (item.cityLabel || '').toLowerCase();
+
+    let score = 0;
+
+    if (name === normalizedKeyword) {
+      score += 1200;
+    }
+
+    if (name.startsWith(normalizedKeyword)) {
+      score += 900;
+    }
+
+    const nameIndex = name.indexOf(normalizedKeyword);
+    if (nameIndex >= 0) {
+      score += 700 - Math.min(nameIndex, 50) * 10;
+    }
+
+    if (category.includes(normalizedKeyword)) {
+      score += 320;
+    }
+
+    if (tags.includes(normalizedKeyword)) {
+      score += 260;
+    }
+
+    if (description.includes(normalizedKeyword)) {
+      score += 180;
+    }
+
+    if (cityLabel.includes(normalizedKeyword)) {
+      score += 120;
+    }
+
+    score += this.resolveScenicScore(item) * 15;
+    score += Math.min(this.resolveScenicHeat(item), 100000) / 5000;
+
+    return score;
+  }
+
+  private collectScenicSuggestionMatches(keyword: string, limit: number): ScenicArea[] {
+    const normalizedKeyword = keyword.trim();
+    if (!normalizedKeyword || !this.scenicSnapshot.length) {
+      return [];
+    }
+
+    const prefixMatches = this.scenicTrie
+      ? this.deduplicateScenic(this.scenicTrie.searchByPrefix(normalizedKeyword, Math.max(60, limit * 8)))
+      : [];
+
+    const containsMatches = this.scenicSnapshot.filter((item) => item.name.toLowerCase().includes(normalizedKeyword.toLowerCase()));
+    const keywordMatches = this.scenicSnapshot.filter((item) => this.matchesScenicKeyword(item, normalizedKeyword));
+
+    return this.deduplicateScenic([...prefixMatches, ...containsMatches, ...keywordMatches])
+      .sort((left, right) => {
+        const scoreDiff = this.scoreScenicSuggestion(right, normalizedKeyword) - this.scoreScenicSuggestion(left, normalizedKeyword);
+        if (scoreDiff !== 0) {
+          return scoreDiff;
+        }
+        return this.sortScenicAreas([left, right])[0].id === left.id ? -1 : 1;
+      })
+      .slice(0, limit);
+  }
+
+  private applyScenicAreaFilters(items: ScenicArea[], categories: string[], minRating?: number): ScenicArea[] {
+    return items.filter((item) => {
+      const matchesCategory = categories.length === 0 || categories.includes(item.category);
+      if (!matchesCategory) {
+        return false;
+      }
+
+      if (typeof minRating === 'number' && Number.isFinite(minRating)) {
+        return this.resolveScenicScore(item) >= minRating;
+      }
+
+      return true;
+    });
+  }
+
+  public initializeScenicTrie(items: ScenicArea[]): Trie<ScenicArea> {
+    const trie = new Trie<ScenicArea>();
+    trie.bulkInsert(items.map((item) => ({ word: item.name, payload: item })));
+    return trie;
+  }
+
   async getScenicAreaDetails(id: string): Promise<{
     scenicArea: ScenicArea;
     attractions: Attraction[];
@@ -238,53 +386,79 @@ export class QueryService {
     };
   }
 
-  async searchScenicAreas(query: string, limit: number = 10): Promise<ScenicArea[]> {
-    const keyword = query.trim();
-    if (!keyword) {
+  async queryScenicAreas(options: ScenicAreaQueryOptions): Promise<ScenicArea[]> {
+    const normalizedName = String(options.name || '').trim();
+    const categories = this.normalizeCategories(options.categories);
+    const minRating =
+      typeof options.minRating === 'number' && Number.isFinite(options.minRating) ? options.minRating : undefined;
+    const limit = Math.max(1, Math.floor(options.limit || 10));
+
+    if (!AppDataSource || !AppDataSource.isInitialized) {
       return [];
     }
 
-    if (AppDataSource && AppDataSource.isInitialized) {
-      await this.ensureScenicTrieReady();
-      if (this.scenicTrie) {
-        const prefixHits = this.deduplicateScenic(this.scenicTrie.searchByPrefix(keyword, Math.max(40, limit * 4)));
-        const containsHits = this.scenicSnapshot.filter(
-          (item) =>
-            item.name.includes(keyword) ||
-            item.description.includes(keyword) ||
-            item.tags.includes(keyword),
-        );
-        const merged = this.deduplicateScenic([...prefixHits, ...containsHits]).sort(
-          (a, b) => (b.averageRating || b.rating || 0) - (a.averageRating || a.rating || 0),
-        );
-        return merged.slice(0, limit);
-      }
+    await this.ensureScenicTrieReady();
 
-      const scenicAreaRepository = AppDataSource.getRepository(ScenicAreaEntity);
-      const entities = await scenicAreaRepository.find({
-        where: [
-          { name: Like(`%${keyword}%`) },
-          { description: Like(`%${keyword}%`) },
-          { tags: Like(`%${keyword}%`) },
-        ],
-        take: limit,
-      });
-      return entities.map((item) => this.mapScenicArea(item));
+    if (!this.scenicSnapshot.length) {
+      return [];
     }
 
-    return [
-      {
-        id: 'fallback-1',
-        name: '示例景区',
-        description: '数据库未初始化，使用本地示例数据',
-        category: '综合',
-        rating: 4.3,
-        tags: '示例',
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        ...resolveScenicPresentation({ name: '示例景区', category: '景区' }),
-      },
-    ].slice(0, limit);
+    let candidates = [...this.scenicSnapshot];
+
+    if (normalizedName) {
+      const prefixMatches = this.scenicTrie
+        ? this.deduplicateScenic(this.scenicTrie.searchByPrefix(normalizedName, Math.max(80, limit * 8)))
+        : [];
+
+      candidates =
+        prefixMatches.length > 0
+          ? prefixMatches
+          : this.scenicSnapshot.filter((item) => this.matchesScenicKeyword(item, normalizedName));
+    }
+
+    const filtered = this.applyScenicAreaFilters(candidates, categories, minRating);
+    return this.sortScenicAreas(filtered).slice(0, limit);
+  }
+
+  async searchScenicAreas(query: string, limit: number = 10): Promise<ScenicArea[]> {
+    return this.queryScenicAreas({ name: query, limit });
+  }
+
+  async searchScenicAreaSuggestions(prefix: string, limit: number = 10): Promise<string[]> {
+    const normalizedPrefix = prefix.trim();
+    if (!normalizedPrefix) {
+      return [];
+    }
+
+    if (!AppDataSource || !AppDataSource.isInitialized) {
+      return [];
+    }
+
+    await this.ensureScenicTrieReady();
+    if (!this.scenicTrie) {
+      return [];
+    }
+
+    const suggestionMatches = this.collectScenicSuggestionMatches(normalizedPrefix, Math.max(1, limit * 3));
+    return suggestionMatches
+      .map((item) => item.name)
+      .filter((item, index, array) => array.indexOf(item) === index)
+      .slice(0, limit);
+  }
+
+  async listScenicAreaCategories(): Promise<string[]> {
+    if (!AppDataSource || !AppDataSource.isInitialized) {
+      return [];
+    }
+
+    await this.ensureScenicTrieReady();
+    return Array.from(
+      new Set(
+        this.scenicSnapshot
+          .map((item) => item.category.trim())
+          .filter(Boolean),
+      ),
+    ).sort((left, right) => left.localeCompare(right, 'zh-CN'));
   }
 
   async searchFacilities(params: {
@@ -678,11 +852,7 @@ export class QueryService {
       order: { popularity: 'DESC' },
     });
     const mapped = entities.map((item) => this.mapScenicArea(item));
-    const trie = new Trie<ScenicArea>();
-    for (const scenic of mapped) {
-      trie.insert(scenic.name, scenic);
-    }
-    this.scenicTrie = trie;
+    this.scenicTrie = this.initializeScenicTrie(mapped);
     this.scenicSnapshot = mapped;
     this.scenicTrieExpireAt = now + 2 * 60 * 1000;
   }

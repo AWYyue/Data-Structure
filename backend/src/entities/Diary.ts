@@ -6,7 +6,7 @@ import { stringArrayJsonTransformer } from '../utils/stringArrayField';
 @Entity('diaries')
 export class Diary {
   @PrimaryGeneratedColumn('uuid')
-  id: string = '';
+  id!: string;
 
   @Column({ type: 'varchar', length: 36, nullable: false })
   userId: string = '';
@@ -29,6 +29,12 @@ export class Diary {
   @Column({ type: 'text', nullable: true, transformer: stringArrayJsonTransformer })
   route: string[] = [];
 
+  @Column({ type: 'text', nullable: true, transformer: stringArrayJsonTransformer })
+  imageUrls: string[] = [];
+
+  @Column({ type: 'text', nullable: true, transformer: stringArrayJsonTransformer })
+  videoUrls: string[] = [];
+
   @Column({ type: 'integer', default: 0 })
   popularity: number = 0;
 
@@ -42,7 +48,7 @@ export class Diary {
   isShared: boolean = false;
 
   @ManyToOne(() => User, user => user.diaries)
-  user: User = new User();
+  user!: User;
 
   @OneToMany(() => DiaryComment, comment => comment.diary)
   comments!: DiaryComment[];

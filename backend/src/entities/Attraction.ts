@@ -11,6 +11,9 @@ export class Attraction {
   @PrimaryGeneratedColumn('uuid')
   id: string = '';
 
+  // Recommendation-only field derived in service layer to avoid schema changes.
+  baseHeat: number = 0;
+
   @Column({ type: 'varchar', length: 36, nullable: false })
   scenicAreaId: string = '';
 

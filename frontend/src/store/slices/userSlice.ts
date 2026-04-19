@@ -49,6 +49,9 @@ const getStoredUser = (): User | null => {
   return normalizeUser(getStoredUserSnapshot<User>());
 };
 
+const initialUser = getStoredUser();
+const initialToken = localStorage.getItem('token');
+
 export interface UserState {
   user: User | null;
   token: string | null;
@@ -58,11 +61,11 @@ export interface UserState {
 }
 
 const initialState: UserState = {
-  user: getStoredUser(),
-  token: localStorage.getItem('token'),
+  user: initialUser,
+  token: initialToken,
   isLoading: false,
   error: null,
-  isAuthenticated: !!localStorage.getItem('token'),
+  isAuthenticated: Boolean(initialToken && initialUser),
 };
 
 export const login = createAsyncThunk(
@@ -85,13 +88,29 @@ export const login = createAsyncThunk(
 
 export const register = createAsyncThunk(
   'user/register',
-  async (
-    { username, email, password }: { username: string; email: string; password: string },
-    { rejectWithValue },
-  ) => {
+  async ({ username, password }: { username: string; password: string }, { rejectWithValue }) => {
     const fallbackMessage = '注册失败';
     try {
-      const response = await userService.register(username, email, password);
+      const response = await userService.register(username, password);
+      if (response.success) {
+        return response.data;
+      }
+      return rejectWithValue(fallbackMessage);
+    } catch (error) {
+      return rejectWithValue(resolveErrorMessage(error, fallbackMessage));
+    }
+  },
+);
+
+export const updatePassword = createAsyncThunk(
+  'user/updatePassword',
+  async (
+    { currentPassword, newPassword }: { currentPassword: string; newPassword: string },
+    { rejectWithValue },
+  ) => {
+    const fallbackMessage = '更新密码失败';
+    try {
+      const response = await userService.updatePassword(currentPassword, newPassword);
       if (response.success) {
         return response.data;
       }
@@ -191,10 +210,9 @@ const userSlice = createSlice({
       .addCase(getCurrentUser.rejected, (state, action) => {
         state.isLoading = false;
         state.error = action.payload as string;
-        if (!state.user) {
-          state.user = getStoredUser();
-        }
-        state.isAuthenticated = Boolean(state.token);
+        state.user = getStoredUser();
+        state.token = localStorage.getItem('token');
+        state.isAuthenticated = Boolean(state.token && state.user);
       })
       .addCase(updateInterests.pending, (state) => {
         state.isLoading = true;
@@ -208,6 +226,21 @@ const userSlice = createSlice({
         }
       })
       .addCase(updateInterests.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      })
+      .addCase(updatePassword.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+      })
+      .addCase(updatePassword.fulfilled, (state, action) => {
+        state.isLoading = false;
+        if (state.user) {
+          state.user.updatedAt = action.payload.updatedAt;
+          localStorage.setItem('user', JSON.stringify(state.user));
+        }
+      })
+      .addCase(updatePassword.rejected, (state, action) => {
         state.isLoading = false;
         state.error = action.payload as string;
       });

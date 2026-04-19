@@ -1,20 +1,21 @@
 export interface User {
   id: string;
   username: string;
-  email: string;
   password?: string;
   createdAt: string;
   updatedAt: string;
+  interests?: string[];
+  interestWeights?: Record<string, number>;
+  favorites?: string[];
 }
 
 export interface LoginRequest {
-  email: string;
+  username: string;
   password: string;
 }
 
 export interface RegisterRequest {
   username: string;
-  email: string;
   password: string;
 }
 

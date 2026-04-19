@@ -1,6 +1,6 @@
 import express from 'express';
 import { DiaryService } from '../services/DiaryService';
-import { authMiddleware } from '../middleware/auth';
+import { authMiddleware, optionalAuthMiddleware } from '../middleware/auth';
 
 const router = express.Router();
 const diaryService = new DiaryService();
@@ -19,7 +19,7 @@ router.get('/generated-animation/:id', async (req, res) => {
 router.post('/', authMiddleware, async (req, res) => {
   try {
     const userId = (req as any).user.userId;
-    const { title, content, destination, visitDate, route, isShared } = req.body;
+    const { title, content, destination, visitDate, route, imageUrls, videoUrls, isShared } = req.body;
     const diary = await diaryService.createDiary({
       userId,
       title,
@@ -27,6 +27,8 @@ router.post('/', authMiddleware, async (req, res) => {
       destination,
       visitDate: visitDate ? new Date(visitDate) : undefined,
       route,
+      imageUrls,
+      videoUrls,
       isShared
     });
     res.status(201).json({
@@ -45,9 +47,11 @@ router.post('/', authMiddleware, async (req, res) => {
 });
 
 // 获取日记详情
-router.get('/:id', async (req, res) => {
+router.get('/:id', optionalAuthMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
+    const viewerUserId = (req as any).user?.userId;
+    await diaryService.incrementDiaryPopularity(id, viewerUserId);
     const diary = await diaryService.getDiaryById(id);
     if (!diary) {
       return res.status(404).json({
@@ -59,7 +63,6 @@ router.get('/:id', async (req, res) => {
       });
     }
     // 增加日记热度
-    await diaryService.incrementDiaryPopularity(id);
     res.status(200).json({
       success: true,
       data: diary
@@ -127,15 +130,18 @@ router.get('/shared/list', async (req, res) => {
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, content, destination, visitDate, route, isShared } = req.body;
+    const actorUserId = (req as any).user.userId;
+    const { title, content, destination, visitDate, route, imageUrls, videoUrls, isShared } = req.body;
     const diary = await diaryService.updateDiary(id, {
       title,
       content,
       destination,
       visitDate: visitDate ? new Date(visitDate) : undefined,
       route,
+      imageUrls,
+      videoUrls,
       isShared
-    });
+    }, actorUserId);
     res.status(200).json({
       success: true,
       data: diary
@@ -155,7 +161,8 @@ router.put('/:id', authMiddleware, async (req, res) => {
 router.delete('/:id', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    await diaryService.deleteDiary(id);
+    const actorUserId = (req as any).user.userId;
+    await diaryService.deleteDiary(id, actorUserId);
     res.status(200).json({
       success: true,
       message: 'Diary deleted successfully'
@@ -175,7 +182,8 @@ router.delete('/:id', authMiddleware, async (req, res) => {
 router.post('/:id/share', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const diary = await diaryService.shareDiary(id);
+    const actorUserId = (req as any).user.userId;
+    const diary = await diaryService.shareDiary(id, actorUserId);
     res.status(200).json({
       success: true,
       data: diary
@@ -196,12 +204,13 @@ router.post('/:id/comments', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
     const userId = (req as any).user.userId;
-    const { content, rating } = req.body;
+    const { content, rating, parentCommentId } = req.body;
     const comment = await diaryService.addComment({
       diaryId: id,
       userId,
       content,
-      rating
+      rating,
+      parentCommentId
     });
     res.status(201).json({
       success: true,
@@ -219,6 +228,26 @@ router.post('/:id/comments', authMiddleware, async (req, res) => {
 });
 
 // 获取日记评论
+router.delete('/:id/comments/:commentId', authMiddleware, async (req, res) => {
+  try {
+    const actorUserId = (req as any).user.userId;
+    const { commentId } = req.params;
+    const comment = await diaryService.deleteComment(commentId, actorUserId);
+    res.status(200).json({
+      success: true,
+      data: comment
+    });
+  } catch (error: any) {
+    res.status(400).json({
+      success: false,
+      error: {
+        code: 'COMMENT_DELETE_FAILED',
+        message: error.message
+      }
+    });
+  }
+});
+
 router.get('/:id/comments', async (req, res) => {
   try {
     const { id } = req.params;
@@ -246,7 +275,7 @@ router.get('/:id/comments', async (req, res) => {
 // 搜索日记
 router.get('/search/query', async (req, res) => {
   try {
-    const { query, limit } = req.query;
+    const { query, limit, mode } = req.query;
     if (!query) {
       return res.status(400).json({
         success: false,
@@ -258,7 +287,8 @@ router.get('/search/query', async (req, res) => {
     }
     const diaries = await diaryService.searchDiaries(
       query as string,
-      limit ? parseInt(limit as string) : 10
+      limit ? parseInt(limit as string) : 10,
+      mode === 'all' ? 'all' : 'any'
     );
     res.status(200).json({
       success: true,
@@ -276,6 +306,37 @@ router.get('/search/query', async (req, res) => {
 });
 
 // 根据目的地搜索日记
+router.get('/search/title', async (req, res) => {
+  try {
+    const { title, limit } = req.query;
+    if (!title) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'MISSING_PARAMS',
+          message: 'title is required'
+        }
+      });
+    }
+    const diaries = await diaryService.searchDiariesByExactTitle(
+      title as string,
+      limit ? parseInt(limit as string) : 10
+    );
+    res.status(200).json({
+      success: true,
+      data: diaries
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'DIARY_SEARCH_FAILED',
+        message: error.message
+      }
+    });
+  }
+});
+
 router.get('/search/destination', async (req, res) => {
   try {
     const { destination, limit } = req.query;

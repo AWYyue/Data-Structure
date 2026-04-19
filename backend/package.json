@@ -9,6 +9,7 @@
     "start": "npm run build && node dist/app.js",
     "test": "jest",
     "check-data": "ts-node src/scripts/checkDataReady.ts",
+    "check:coordinates": "ts-node src/scripts/checkCoordinateOverlaps.ts",
     "repair-data:arrays": "set DB_LOGGING=false&& ts-node src/scripts/repairSerializedArrays.ts",
     "setup:data": "npm run import-data:real-template",
     "setup:data:with-covers": "npm run import-data:real-template && npm run import-covers:v2",

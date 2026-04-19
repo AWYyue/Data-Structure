@@ -28,8 +28,8 @@ const rankingDescMap: Record<RankingType, string> = {
 const stageCards = [
   {
     title: '旅游前',
-    subtitle: '兴趣采集、目的地推荐、榜单筛选与一日计划生成。',
-    tags: ['个性化推荐', '排行筛选', '一日计划'],
+  subtitle: '?????????? AIGC ?????',
+  tags: ['????', '????', 'AIGC ??'],
     actionLabel: '进入智能行程',
     accent: 'linear-gradient(135deg, rgba(109,93,252,0.18), rgba(125,211,252,0.18))',
     to: '/journey',
@@ -44,8 +44,8 @@ const stageCards = [
   },
   {
     title: '旅游后',
-    subtitle: '旅行日记、社交打卡、成就记录与 AIGC 动画沉浸。',
-    tags: ['旅行日记', '社交互动', '成就系统'],
+    subtitle: '?????????? AIGC ?????',
+    tags: ['????', '????', 'AIGC ??'],
     actionLabel: '进入旅行日记',
     accent: 'linear-gradient(135deg, rgba(251,146,60,0.14), rgba(251,191,36,0.18))',
     to: '/diary',

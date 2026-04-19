@@ -1,21 +1,11 @@
 import { AppDataSource } from '../config/database';
+import { In } from 'typeorm';
+import { HuffmanCompressor } from '../algorithms/HuffmanCompressor';
 import { Diary } from '../entities/Diary';
 import { DiaryComment } from '../entities/DiaryComment';
 import { User } from '../entities/User';
 import { normalizeStringArray } from '../utils/stringArrayField';
-
-// 简单的Huffman压缩实现（用于演示）
-class HuffmanCompressor {
-  compress(text: string): string {
-    // 简单的压缩实现，实际项目中应使用更复杂的算法
-    return text;
-  }
-
-  decompress(compressed: string): string {
-    // 简单的解压实现
-    return compressed;
-  }
-}
+import { DiarySearchIndex, DiarySearchMode } from './DiarySearchIndex';
 
 // 内存存储作为fallback
 let memoryDiaries: Diary[] = [];
@@ -23,24 +13,26 @@ let memoryDiaryComments: DiaryComment[] = [];
 let memoryNextDiaryId = 1;
 let memoryNextCommentId = 1;
 const generatedAnimations = new Map<string, { html: string; createdAt: number }>();
+const diarySearchIndex = new DiarySearchIndex();
+let diarySearchIndexLoaded = false;
 
 // 获取仓库
 function getDiaryRepository() {
-  if (AppDataSource) {
+  if (AppDataSource?.isInitialized) {
     return AppDataSource.getRepository(Diary);
   }
   return null;
 }
 
 function getDiaryCommentRepository() {
-  if (AppDataSource) {
+  if (AppDataSource?.isInitialized) {
     return AppDataSource.getRepository(DiaryComment);
   }
   return null;
 }
 
 function getUserRepository() {
-  if (AppDataSource) {
+  if (AppDataSource?.isInitialized) {
     return AppDataSource.getRepository(User);
   }
   return null;
@@ -51,6 +43,235 @@ const huffmanCompressor = new HuffmanCompressor();
 export class DiaryService {
   getGeneratedAnimation(animationId: string): { html: string; createdAt: number } | null {
     return generatedAnimations.get(animationId) || null;
+  }
+
+  private normalizeImageUrls(imageUrls: unknown): string[] {
+    return normalizeStringArray(imageUrls).filter((item) => /^data:image\/|^https?:\/\//i.test(item));
+  }
+
+  private normalizeVideoUrls(videoUrls: unknown): string[] {
+    return normalizeStringArray(videoUrls).filter((item) => /^data:video\/|^https?:\/\//i.test(item));
+  }
+
+  private hydrateDiary<T extends Diary | null>(diary: T): T {
+    if (!diary) {
+      return diary;
+    }
+
+    if ((!diary.content || !diary.content.trim()) && diary.compressedContent?.length) {
+      diary.content = huffmanCompressor.decompressFromBuffer(diary.compressedContent);
+    }
+
+    diary.route = normalizeStringArray(diary.route);
+    diary.imageUrls = this.normalizeImageUrls(diary.imageUrls);
+    diary.videoUrls = this.normalizeVideoUrls((diary as Diary).videoUrls);
+    return diary;
+  }
+
+  private hydrateComment<T extends DiaryComment | null>(comment: T): T {
+    if (!comment) {
+      return comment;
+    }
+
+    if (comment.isDeleted) {
+      comment.content = '该评论已删除';
+      comment.rating = null;
+    }
+
+    if (Array.isArray(comment.replies)) {
+      comment.replies = comment.replies.map((reply) => this.hydrateComment(reply));
+    }
+
+    return comment;
+  }
+
+  private collectCommentCascadeIds(
+    comments: Array<Pick<DiaryComment, 'id' | 'parentCommentId'>>,
+    rootCommentId: string,
+  ): string[] {
+    const collectedIds = new Set<string>([rootCommentId]);
+    let changed = true;
+
+    while (changed) {
+      changed = false;
+      for (const comment of comments) {
+        if (comment.parentCommentId && collectedIds.has(comment.parentCommentId) && !collectedIds.has(comment.id)) {
+          collectedIds.add(comment.id);
+          changed = true;
+        }
+      }
+    }
+
+    return Array.from(collectedIds);
+  }
+
+  private async awardFirstCommentPopularity(diaryId: string, userId: string): Promise<number> {
+    const diaryRepository = getDiaryRepository();
+    const userRepository = getUserRepository();
+    const commentToken = `diary-comment:${diaryId}`;
+
+    if (diaryRepository && userRepository) {
+      const [diary, user] = await Promise.all([
+        diaryRepository.findOne({ where: { id: diaryId }, relations: ['user'] }),
+        userRepository.findOne({ where: { id: userId } }),
+      ]);
+
+      if (!diary || !user) {
+        return 0;
+      }
+
+      if (diary.userId === userId) {
+        return 0;
+      }
+
+      user.viewedItems = normalizeStringArray(user.viewedItems);
+      if (user.viewedItems.includes(commentToken)) {
+        return 0;
+      }
+
+      user.viewedItems = [...user.viewedItems, commentToken];
+      diary.popularity += 300;
+      diary.updatedAt = new Date();
+
+      await Promise.all([userRepository.save(user), diaryRepository.save(diary)]);
+      if (diary.isShared) {
+        this.syncDiarySearchIndex(diary);
+      }
+      return 300;
+    }
+
+    const diary = memoryDiaries.find((item) => item.id === diaryId);
+    if (!diary) {
+      return 0;
+    }
+
+    if (diary.userId === userId) {
+      return 0;
+    }
+
+    const existingCommentCount = memoryDiaryComments.filter(
+      (item) => item.diaryId === diaryId && item.userId === userId,
+    ).length;
+    if (existingCommentCount > 1) {
+      return 0;
+    }
+
+    diary.popularity += 300;
+    diary.updatedAt = new Date();
+    if (diary.isShared) {
+      this.syncDiarySearchIndex(diary);
+    }
+    return 300;
+  }
+
+  private buildCommentTree(comments: DiaryComment[]): DiaryComment[] {
+    const nodeMap = new Map<string, DiaryComment>();
+    const roots: DiaryComment[] = [];
+
+    comments.forEach((comment) => {
+      comment.replies = [];
+      nodeMap.set(comment.id, this.hydrateComment(comment));
+    });
+
+    comments.forEach((comment) => {
+      const current = nodeMap.get(comment.id)!;
+      if (comment.parentCommentId) {
+        const parent = nodeMap.get(comment.parentCommentId);
+        if (parent) {
+          parent.replies.push(current);
+          return;
+        }
+      }
+      roots.push(current);
+    });
+
+    const sortTree = (items: DiaryComment[]) => {
+      items.sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime());
+      items.forEach((item) => sortTree(item.replies || []));
+      return items;
+    };
+
+    return sortTree(roots);
+  }
+
+  private async canManageComment(commentId: string, actorUserId: string): Promise<DiaryComment> {
+    const diaryCommentRepository = getDiaryCommentRepository();
+    const comment = diaryCommentRepository
+      ? await diaryCommentRepository.findOne({ where: { id: commentId } })
+      : memoryDiaryComments.find((item) => item.id === commentId) || null;
+
+    if (!comment) {
+      throw new Error('Comment not found');
+    }
+
+    if (comment.userId === actorUserId) {
+      return this.hydrateComment(comment);
+    }
+
+    const diary = await this.getDiaryById(comment.diaryId);
+    if (!diary || diary.userId !== actorUserId) {
+      throw new Error('You do not have permission to manage this comment');
+    }
+
+    return comment;
+  }
+
+  private async ensureSearchIndexLoaded(): Promise<void> {
+    if (diarySearchIndexLoaded) {
+      return;
+    }
+
+    const diaryRepository = getDiaryRepository();
+    if (diaryRepository) {
+      const sharedDiaries = await diaryRepository.find({
+        where: { isShared: true },
+        relations: ['user'],
+      });
+      diarySearchIndex.rebuild(sharedDiaries.map((item) => this.hydrateDiary(item)));
+    } else {
+      diarySearchIndex.rebuild(memoryDiaries.filter((item) => item.isShared).map((item) => this.hydrateDiary(item)));
+    }
+
+    diarySearchIndexLoaded = true;
+  }
+
+  private syncDiarySearchIndex(diary: Diary): void {
+    diarySearchIndex.upsert(this.hydrateDiary(diary));
+    diarySearchIndexLoaded = true;
+  }
+
+  private removeDiaryFromSearchIndex(diaryId: string): void {
+    diarySearchIndex.remove(diaryId);
+    diarySearchIndexLoaded = true;
+  }
+
+  private async assertDiaryOwner(diaryId: string, actorUserId?: string): Promise<Diary> {
+    const diaryRepository = getDiaryRepository();
+    const diary = diaryRepository
+      ? await diaryRepository.findOne({ where: { id: diaryId } })
+      : memoryDiaries.find((item) => item.id === diaryId) || null;
+
+    if (!diary) {
+      throw new Error('Diary not found');
+    }
+
+    if (actorUserId && diary.userId !== actorUserId) {
+      throw new Error('You can only modify your own diary');
+    }
+
+    return diary;
+  }
+
+  private orderDiariesByIds(diaries: Diary[], orderedIds: string[]): Diary[] {
+    const scoreMap = new Map(orderedIds.map((id, index) => [id, index]));
+    return [...diaries].sort((left, right) => {
+      const leftIndex = scoreMap.get(left.id) ?? Number.MAX_SAFE_INTEGER;
+      const rightIndex = scoreMap.get(right.id) ?? Number.MAX_SAFE_INTEGER;
+      if (leftIndex !== rightIndex) {
+        return leftIndex - rightIndex;
+      }
+      return right.popularity - left.popularity;
+    });
   }
 
   private buildAnimationPreviewHtml(photos: { url: string }[], description: string): string {
@@ -210,11 +431,13 @@ export class DiaryService {
     destination?: string;
     visitDate?: Date;
     route?: string[];
+    imageUrls?: string[];
+    videoUrls?: string[];
     isShared?: boolean;
   }): Promise<Diary> {
     const diaryRepository = getDiaryRepository();
     // 压缩内容
-    const compressedContent = huffmanCompressor.compress(diaryData.content);
+    const compressedContent = huffmanCompressor.compressToBuffer(diaryData.content);
     
     if (diaryRepository) {
       // 创建日记
@@ -222,14 +445,20 @@ export class DiaryService {
         userId: diaryData.userId,
         title: diaryData.title,
         content: diaryData.content,
-        compressedContent: Buffer.from(compressedContent),
+        compressedContent,
         destination: diaryData.destination,
         visitDate: diaryData.visitDate,
         route: normalizeStringArray(diaryData.route),
+        imageUrls: this.normalizeImageUrls(diaryData.imageUrls),
+        videoUrls: this.normalizeVideoUrls(diaryData.videoUrls),
         isShared: diaryData.isShared || false
       });
 
-      return await diaryRepository.save(diary);
+      const savedDiary = await diaryRepository.save(diary);
+      if (savedDiary.isShared) {
+        this.syncDiarySearchIndex(savedDiary);
+      }
+      return this.hydrateDiary(savedDiary);
     } else {
       // 使用内存存储
       const diary = {
@@ -237,10 +466,12 @@ export class DiaryService {
         userId: diaryData.userId,
         title: diaryData.title,
         content: diaryData.content,
-        compressedContent: Buffer.from(compressedContent),
+        compressedContent,
         destination: diaryData.destination,
         visitDate: diaryData.visitDate,
         route: normalizeStringArray(diaryData.route),
+        imageUrls: this.normalizeImageUrls(diaryData.imageUrls),
+        videoUrls: this.normalizeVideoUrls(diaryData.videoUrls),
         isShared: diaryData.isShared || false,
         reviewCount: 0,
         averageRating: 0,
@@ -251,7 +482,10 @@ export class DiaryService {
         comments: []
       } as Diary;
       memoryDiaries.push(diary);
-      return diary;
+      if (diary.isShared) {
+        this.syncDiarySearchIndex(diary);
+      }
+      return this.hydrateDiary(diary);
     }
   }
 
@@ -260,10 +494,11 @@ export class DiaryService {
     const diaryRepository = getDiaryRepository();
     
     if (diaryRepository) {
-      return await diaryRepository.findOne({
+      const diary = await diaryRepository.findOne({
         where: { id: diaryId },
         relations: ['user', 'comments', 'comments.user']
       });
+      return this.hydrateDiary(diary);
     } else {
       // 使用内存存储
       const diary = memoryDiaries.find(d => d.id === diaryId);
@@ -271,7 +506,7 @@ export class DiaryService {
         // 添加评论
         diary.comments = memoryDiaryComments.filter(c => c.diaryId === diaryId);
       }
-      return diary || null;
+      return this.hydrateDiary(diary || null);
     }
   }
 
@@ -280,18 +515,19 @@ export class DiaryService {
     const diaryRepository = getDiaryRepository();
     
     if (diaryRepository) {
-      return await diaryRepository.find({
+      const diaries = await diaryRepository.find({
         where: { userId },
-        order: { createdAt: 'DESC' },
-        take: limit,
-        skip: offset
+        order: { createdAt: 'ASC' },
+        relations: ['user']
       });
+      return diaries.map((item) => this.hydrateDiary(item));
     } else {
       // 使用内存存储
       return memoryDiaries
         .filter(d => d.userId === userId)
         .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
-        .slice(offset, offset + limit);
+        .slice(offset, offset + limit)
+        .map((item) => this.hydrateDiary(item));
     }
   }
 
@@ -300,19 +536,21 @@ export class DiaryService {
     const diaryRepository = getDiaryRepository();
     
     if (diaryRepository) {
-      return await diaryRepository.find({
+      const diaries = await diaryRepository.find({
         where: { isShared: true },
         order: { popularity: 'DESC' },
         take: limit,
         skip: offset,
         relations: ['user']
       });
+      return diaries.map((item) => this.hydrateDiary(item));
     } else {
       // 使用内存存储
       return memoryDiaries
         .filter(d => d.isShared)
         .sort((a, b) => b.popularity - a.popularity)
-        .slice(offset, offset + limit);
+        .slice(offset, offset + limit)
+        .map((item) => this.hydrateDiary(item));
     }
   }
 
@@ -323,21 +561,17 @@ export class DiaryService {
     destination?: string;
     visitDate?: Date;
     route?: string[];
+    imageUrls?: string[];
+    videoUrls?: string[];
     isShared?: boolean;
-  }): Promise<Diary> {
+  }, actorUserId?: string): Promise<Diary> {
     const diaryRepository = getDiaryRepository();
-    let diary;
+    let diary = await this.assertDiaryOwner(diaryId, actorUserId);
     
     if (diaryRepository) {
-      diary = await diaryRepository.findOne({ where: { id: diaryId } });
-      if (!diary) {
-        throw new Error('Diary not found');
-      }
-
       // 如果更新内容，重新压缩
       if (updateData.content) {
-        const compressedContent = huffmanCompressor.compress(updateData.content);
-        diary.compressedContent = Buffer.from(compressedContent);
+        diary.compressedContent = huffmanCompressor.compressToBuffer(updateData.content);
       }
 
       // 更新其他字段
@@ -345,25 +579,38 @@ export class DiaryService {
       if (updateData.route !== undefined) {
         diary.route = normalizeStringArray(updateData.route);
       }
+      if (updateData.imageUrls !== undefined) {
+        diary.imageUrls = this.normalizeImageUrls(updateData.imageUrls);
+      }
+      if (updateData.videoUrls !== undefined) {
+        diary.videoUrls = this.normalizeVideoUrls(updateData.videoUrls);
+      }
 
-      return await diaryRepository.save(diary);
+      const savedDiary = await diaryRepository.save(diary);
+      if (savedDiary.isShared) {
+        this.syncDiarySearchIndex(savedDiary);
+      } else {
+        this.removeDiaryFromSearchIndex(savedDiary.id);
+      }
+
+      return this.hydrateDiary(savedDiary);
     } else {
       // 使用内存存储
-      diary = memoryDiaries.find(d => d.id === diaryId);
-      if (!diary) {
-        throw new Error('Diary not found');
-      }
-
       // 如果更新内容，重新压缩
       if (updateData.content) {
-        const compressedContent = huffmanCompressor.compress(updateData.content);
-        diary.compressedContent = Buffer.from(compressedContent);
+        diary.compressedContent = huffmanCompressor.compressToBuffer(updateData.content);
       }
 
       // 更新其他字段
       Object.assign(diary, updateData);
       if (updateData.route !== undefined) {
         diary.route = normalizeStringArray(updateData.route);
+      }
+      if (updateData.imageUrls !== undefined) {
+        diary.imageUrls = this.normalizeImageUrls(updateData.imageUrls);
+      }
+      if (updateData.videoUrls !== undefined) {
+        diary.videoUrls = this.normalizeVideoUrls(updateData.videoUrls);
       }
       diary.updatedAt = new Date();
 
@@ -373,19 +620,27 @@ export class DiaryService {
         memoryDiaries[index] = diary;
       }
 
-      return diary;
+      if (diary.isShared) {
+        this.syncDiarySearchIndex(diary);
+      } else {
+        this.removeDiaryFromSearchIndex(diary.id);
+      }
+
+      return this.hydrateDiary(diary);
     }
   }
 
   // 删除日记
-  async deleteDiary(diaryId: string): Promise<void> {
+  async deleteDiary(diaryId: string, actorUserId?: string): Promise<void> {
     const diaryRepository = getDiaryRepository();
+    await this.assertDiaryOwner(diaryId, actorUserId);
     
     if (diaryRepository) {
       const result = await diaryRepository.delete(diaryId);
       if (result.affected === 0) {
         throw new Error('Diary not found');
       }
+      this.removeDiaryFromSearchIndex(diaryId);
     } else {
       // 使用内存存储
       const index = memoryDiaries.findIndex(d => d.id === diaryId);
@@ -396,29 +651,22 @@ export class DiaryService {
       memoryDiaries.splice(index, 1);
       // 删除相关评论
       memoryDiaryComments = memoryDiaryComments.filter(c => c.diaryId !== diaryId);
+      this.removeDiaryFromSearchIndex(diaryId);
     }
   }
 
   // 分享日记
-  async shareDiary(diaryId: string): Promise<Diary> {
+  async shareDiary(diaryId: string, actorUserId?: string): Promise<Diary> {
     const diaryRepository = getDiaryRepository();
-    let diary;
+    let diary = await this.assertDiaryOwner(diaryId, actorUserId);
     
     if (diaryRepository) {
-      diary = await diaryRepository.findOne({ where: { id: diaryId } });
-      if (!diary) {
-        throw new Error('Diary not found');
-      }
-
       diary.isShared = true;
-      return await diaryRepository.save(diary);
+      const savedDiary = await diaryRepository.save(diary);
+      this.syncDiarySearchIndex(savedDiary);
+      return this.hydrateDiary(savedDiary);
     } else {
       // 使用内存存储
-      diary = memoryDiaries.find(d => d.id === diaryId);
-      if (!diary) {
-        throw new Error('Diary not found');
-      }
-
       diary.isShared = true;
       diary.updatedAt = new Date();
 
@@ -428,7 +676,8 @@ export class DiaryService {
         memoryDiaries[index] = diary;
       }
 
-      return diary;
+      this.syncDiarySearchIndex(diary);
+      return this.hydrateDiary(diary);
     }
   }
 
@@ -438,9 +687,15 @@ export class DiaryService {
     userId: string;
     content: string;
     rating?: number;
+    parentCommentId?: string;
   }): Promise<DiaryComment> {
     const diaryRepository = getDiaryRepository();
     const diaryCommentRepository = getDiaryCommentRepository();
+    const normalizedContent = String(commentData.content || '').trim();
+
+    if (!normalizedContent) {
+      throw new Error('Comment content is required');
+    }
     
     if (diaryRepository && diaryCommentRepository) {
       // 检查日记是否存在
@@ -450,19 +705,35 @@ export class DiaryService {
       }
 
       // 创建评论
+      if (commentData.parentCommentId) {
+        const parentComment = await diaryCommentRepository.findOne({
+          where: { id: commentData.parentCommentId, diaryId: commentData.diaryId },
+        });
+        if (!parentComment) {
+          throw new Error('Parent comment not found');
+        }
+      }
+
       const comment = diaryCommentRepository.create({
         diaryId: commentData.diaryId,
         userId: commentData.userId,
-        content: commentData.content,
-        rating: commentData.rating
+        parentCommentId: commentData.parentCommentId || null,
+        content: normalizedContent,
+        rating: commentData.parentCommentId ? null : commentData.rating,
+        isDeleted: false
       });
 
       const savedComment = await diaryCommentRepository.save(comment);
+      await this.awardFirstCommentPopularity(commentData.diaryId, commentData.userId);
 
       // 更新日记的评论数和平均评分
       await this.updateDiaryStats(commentData.diaryId);
 
-      return savedComment;
+      const hydrated = await diaryCommentRepository.findOne({
+        where: { id: savedComment.id },
+        relations: ['user']
+      });
+      return this.hydrateComment(hydrated || savedComment);
     } else {
       // 使用内存存储
       // 检查日记是否存在
@@ -472,24 +743,38 @@ export class DiaryService {
       }
 
       // 创建评论
+      if (commentData.parentCommentId) {
+        const parentComment = memoryDiaryComments.find(
+          (item) => item.id === commentData.parentCommentId && item.diaryId === commentData.diaryId,
+        );
+        if (!parentComment) {
+          throw new Error('Parent comment not found');
+        }
+      }
+
       const comment = {
         id: `memory-comment-${memoryNextCommentId++}`,
         diaryId: commentData.diaryId,
         userId: commentData.userId,
-        content: commentData.content,
-        rating: commentData.rating,
+        parentCommentId: commentData.parentCommentId || null,
+        content: normalizedContent,
+        rating: commentData.parentCommentId ? null : commentData.rating ?? null,
+        isDeleted: false,
         diary: null as any,
         createdAt: new Date(),
         updatedAt: new Date(),
-        user: null as any
+        user: null as any,
+        parentComment: null as any,
+        replies: [],
       } as DiaryComment;
 
       memoryDiaryComments.push(comment);
+      await this.awardFirstCommentPopularity(commentData.diaryId, commentData.userId);
 
       // 更新日记的评论数和平均评分
       await this.updateDiaryStats(commentData.diaryId);
 
-      return comment;
+      return this.hydrateComment(comment);
     }
   }
 
@@ -498,20 +783,44 @@ export class DiaryService {
     const diaryCommentRepository = getDiaryCommentRepository();
     
     if (diaryCommentRepository) {
-      return await diaryCommentRepository.find({
+      const comments = await diaryCommentRepository.find({
         where: { diaryId },
-        order: { createdAt: 'DESC' },
-        take: limit,
-        skip: offset,
+        order: { createdAt: 'ASC' },
         relations: ['user']
       });
+      return this.buildCommentTree(comments.filter((comment) => !comment.isDeleted)).slice(offset, offset + limit);
     } else {
       // 使用内存存储
-      return memoryDiaryComments
-        .filter(c => c.diaryId === diaryId)
-        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
-        .slice(offset, offset + limit);
+      const comments = memoryDiaryComments
+        .filter(c => c.diaryId === diaryId && !c.isDeleted)
+        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+      return this.buildCommentTree(comments).slice(offset, offset + limit);
     }
+  }
+
+  async deleteComment(commentId: string, actorUserId: string): Promise<DiaryComment> {
+    const diaryCommentRepository = getDiaryCommentRepository();
+    const comment = await this.canManageComment(commentId, actorUserId);
+
+    if (diaryCommentRepository) {
+      const diaryComments = await diaryCommentRepository.find({
+        where: { diaryId: comment.diaryId },
+      });
+      const deleteIds = this.collectCommentCascadeIds(diaryComments, commentId);
+      if (deleteIds.length > 0) {
+        await diaryCommentRepository.delete(deleteIds);
+        await this.updateDiaryStats(comment.diaryId);
+      }
+      return this.hydrateComment(comment);
+    }
+
+    const deleteIds = this.collectCommentCascadeIds(
+      memoryDiaryComments.filter((item) => item.diaryId === comment.diaryId),
+      commentId,
+    );
+    memoryDiaryComments = memoryDiaryComments.filter((item) => !deleteIds.includes(item.id));
+    await this.updateDiaryStats(comment.diaryId);
+    return this.hydrateComment(comment);
   }
 
   // 更新日记统计信息
@@ -522,25 +831,35 @@ export class DiaryService {
     if (diaryCommentRepository && diaryRepository) {
       // 获取所有评论
       const comments = await diaryCommentRepository.find({ where: { diaryId } });
+      const activeComments = comments.filter(c => !c.isDeleted);
       
       // 计算平均评分
-      const ratings = comments.filter(c => c.rating !== null && c.rating !== undefined).map(c => c.rating!);
+      const ratings = activeComments
+        .filter(c => c.rating !== null && c.rating !== undefined)
+        .map(c => Number(c.rating));
       const averageRating = ratings.length > 0 
         ? ratings.reduce((sum, rating) => sum + rating, 0) / ratings.length 
         : 0;
 
       // 更新日记
       await diaryRepository.update(diaryId, {
-        reviewCount: comments.length,
+        reviewCount: activeComments.length,
         averageRating: averageRating
       });
+      const diary = await diaryRepository.findOne({ where: { id: diaryId }, relations: ['user'] });
+      if (diary?.isShared) {
+        this.syncDiarySearchIndex(diary);
+      }
     } else {
       // 使用内存存储
       // 获取所有评论
       const comments = memoryDiaryComments.filter(c => c.diaryId === diaryId);
+      const activeComments = comments.filter(c => !c.isDeleted);
       
       // 计算平均评分
-      const ratings = comments.filter(c => c.rating !== null && c.rating !== undefined).map(c => c.rating!);
+      const ratings = activeComments
+        .filter(c => c.rating !== null && c.rating !== undefined)
+        .map(c => Number(c.rating));
       const averageRating = ratings.length > 0 
         ? ratings.reduce((sum, rating) => sum + rating, 0) / ratings.length 
         : 0;
@@ -548,73 +867,132 @@ export class DiaryService {
       // 更新日记
       const diary = memoryDiaries.find(d => d.id === diaryId);
       if (diary) {
-        diary.reviewCount = comments.length;
+        diary.reviewCount = activeComments.length;
         diary.averageRating = averageRating;
         diary.updatedAt = new Date();
+        if (diary.isShared) {
+          this.syncDiarySearchIndex(diary);
+        }
       }
     }
   }
 
   // 增加日记热度
-  async incrementDiaryPopularity(diaryId: string): Promise<void> {
+  async incrementDiaryPopularity(diaryId: string, viewerUserId?: string): Promise<number> {
+    if (!viewerUserId) {
+      return 0;
+    }
+
     const diaryRepository = getDiaryRepository();
+    const userRepository = getUserRepository();
+    const viewToken = `diary:${diaryId}`;
     
-    if (diaryRepository) {
-      await diaryRepository.increment({ id: diaryId }, 'popularity', 1);
+    if (diaryRepository && userRepository) {
+      const [diary, viewer] = await Promise.all([
+        diaryRepository.findOne({ where: { id: diaryId }, relations: ['user'] }),
+        userRepository.findOne({ where: { id: viewerUserId } }),
+      ]);
+      if (!diary) {
+        return 0;
+      }
+      if (!viewer || diary.userId === viewerUserId) {
+        return 0;
+      }
+      viewer.viewedItems = normalizeStringArray(viewer.viewedItems);
+      if (viewer.viewedItems.includes(viewToken)) {
+        return 0;
+      }
+      viewer.viewedItems = [...viewer.viewedItems, viewToken];
+      diary.popularity += 500;
+      diary.updatedAt = new Date();
+      await Promise.all([userRepository.save(viewer), diaryRepository.save(diary)]);
+      if (diary.isShared) {
+        this.syncDiarySearchIndex(diary);
+      }
+      return 500;
     } else {
       // 使用内存存储
       const diary = memoryDiaries.find(d => d.id === diaryId);
-      if (diary) {
-        diary.popularity++;
-        diary.updatedAt = new Date();
+      if (!diary || diary.userId === viewerUserId) {
+        return 0;
       }
+      diary.popularity += 500;
+      diary.updatedAt = new Date();
+      if (diary.isShared) {
+        this.syncDiarySearchIndex(diary);
+      }
+      return 500;
     }
   }
 
   // 搜索日记
-  async searchDiaries(query: string, limit: number = 10): Promise<Diary[]> {
+  async searchDiaries(query: string, limit: number = 10, mode: DiarySearchMode = 'any'): Promise<Diary[]> {
     const diaryRepository = getDiaryRepository();
+    await this.ensureSearchIndexLoaded();
+    const orderedIds = diarySearchIndex.searchFulltext(query, mode, limit);
+
+    if (!orderedIds.length) {
+      return [];
+    }
     
     if (diaryRepository) {
-      return await diaryRepository.createQueryBuilder('diary')
-        .where('diary.isShared = :isShared', { isShared: true })
-        .andWhere('diary.title LIKE :query OR diary.content LIKE :query', { query: `%${query}%` })
-        .orderBy('diary.popularity', 'DESC')
-        .take(limit)
-        .getMany();
+      const diaries = await diaryRepository.find({
+        where: { id: In(orderedIds), isShared: true },
+        relations: ['user']
+      });
+      return this.orderDiariesByIds(diaries.map((item) => this.hydrateDiary(item)), orderedIds).slice(0, limit);
     } else {
       // 使用内存存储
-      return memoryDiaries
-        .filter(d => d.isShared && (d.title.includes(query) || d.content.includes(query)))
-        .sort((a, b) => b.popularity - a.popularity)
-        .slice(0, limit);
+      const diaries = memoryDiaries.filter((item) => orderedIds.includes(item.id));
+      return this.orderDiariesByIds(diaries.map((item) => this.hydrateDiary(item)), orderedIds).slice(0, limit);
     }
   }
 
   // 根据目的地搜索日记
   async searchDiariesByDestination(destination: string, limit: number = 10): Promise<Diary[]> {
     const diaryRepository = getDiaryRepository();
+    await this.ensureSearchIndexLoaded();
+    const orderedIds = diarySearchIndex.searchByDestination(destination, limit);
+
+    if (!orderedIds.length) {
+      return [];
+    }
     
     if (diaryRepository) {
-      return await diaryRepository.find({
-        where: {
-          isShared: true,
-          destination: destination
-        },
-        order: { popularity: 'DESC' },
-        take: limit,
+      const diaries = await diaryRepository.find({
+        where: { id: In(orderedIds), isShared: true },
         relations: ['user']
       });
+      return this.orderDiariesByIds(diaries.map((item) => this.hydrateDiary(item)), orderedIds).slice(0, limit);
     } else {
       // 使用内存存储
-      return memoryDiaries
-        .filter(d => d.isShared && d.destination === destination)
-        .sort((a, b) => b.popularity - a.popularity)
-        .slice(0, limit);
+      const diaries = memoryDiaries.filter((item) => orderedIds.includes(item.id));
+      return this.orderDiariesByIds(diaries.map((item) => this.hydrateDiary(item)), orderedIds).slice(0, limit);
     }
   }
 
   // 生成AIGC动画
+  async searchDiariesByExactTitle(title: string, limit: number = 10): Promise<Diary[]> {
+    const diaryRepository = getDiaryRepository();
+    await this.ensureSearchIndexLoaded();
+    const orderedIds = diarySearchIndex.searchByExactTitle(title, limit);
+
+    if (!orderedIds.length) {
+      return [];
+    }
+
+    if (diaryRepository) {
+      const diaries = await diaryRepository.find({
+        where: { id: In(orderedIds), isShared: true },
+        relations: ['user']
+      });
+      return this.orderDiariesByIds(diaries.map((item) => this.hydrateDiary(item)), orderedIds).slice(0, limit);
+    }
+
+    const diaries = memoryDiaries.filter((item) => orderedIds.includes(item.id));
+    return this.orderDiariesByIds(diaries.map((item) => this.hydrateDiary(item)), orderedIds).slice(0, limit);
+  }
+
   private buildPremiumAnimationPreviewHtml(photos: { url: string }[], description: string): string {
     const safeDescription = description
       .replace(/&/g, '&amp;')

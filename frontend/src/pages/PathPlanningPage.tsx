@@ -3,6 +3,7 @@ import { App as AntdApp, AutoComplete, Button, Card, Checkbox, Col, Empty, Radio
 import { AimOutlined, PlusOutlined, ReloadOutlined, SwapOutlined } from '@ant-design/icons';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import MapComponent from '../components/MapComponent';
+import useCurrentLocation from '../hooks/useCurrentLocation';
 import pathPlanningService, {
   MultiPointPath,
   MultiPointStrategy,
@@ -322,6 +323,20 @@ const PathPlanningPage: React.FC = () => {
   const [activeTransportPlanId, setActiveTransportPlanId] = useState<string | null>(null);
   const [baseMapMode, setBaseMapMode] = useState<'street' | 'scenic'>('scenic');
   const [showRoadNetwork, setShowRoadNetwork] = useState(false);
+  const {
+    location: currentLocation,
+    error: currentLocationError,
+    isLoading: resolvingCurrentLocation,
+    isWatching: isWatchingCurrentLocation,
+    requestLocation,
+    startWatching,
+    stopWatching,
+    getLatestError: getLatestCurrentLocationError,
+  } = useCurrentLocation({
+    enableHighAccuracy: true,
+    timeout: 8000,
+    maximumAge: 30000,
+  });
 
   const startTimerRef = useRef<number | null>(null);
   const endTimerRef = useRef<number | null>(null);
@@ -857,64 +872,111 @@ const PathPlanningPage: React.FC = () => {
     return { nodeId: nearest.data.nodeId, option };
   };
 
+  const buildCurrentLocationOption = async (
+    latitude: number,
+    longitude: number,
+  ): Promise<SearchOption | null> => {
+    try {
+      const response = await pathPlanningService.findNearestNode(latitude, longitude, scenicAreaId || undefined);
+      const matched =
+        optionRegistry.get(response.data.nodeId) || localOptions.find((item) => item.value === response.data.nodeId);
+      return matched
+        ? {
+            ...matched,
+            label: '当前位置',
+            placeName: '当前位置',
+            placeType: 'poi',
+            latitude,
+            longitude,
+          }
+        : {
+            value: response.data.nodeId,
+            label: '当前位置',
+            placeName: '当前位置',
+            placeType: 'poi',
+            scenicAreaId,
+            latitude,
+            longitude,
+          };
+    } catch (error) {
+      message.error(resolveErrorMessage(error, '获取当前位置失败，请稍后重试。'));
+      return null;
+    }
+  };
+
   const getCurrentLocationOption = async (): Promise<SearchOption | null> => {
-    if (!navigator.geolocation) {
-      message.warning('当前浏览器不支持定位。');
+    const nextLocation = currentLocation || (await requestLocation());
+    if (!nextLocation) {
+      message.warning({
+        key: 'path-current-location-error',
+        content: getLatestCurrentLocationError() || currentLocationError || '无法获取当前位置。',
+      });
       return null;
     }
 
-    return new Promise((resolve) => {
-      navigator.geolocation.getCurrentPosition(
-        async (position) => {
-          try {
-            const response = await pathPlanningService.findNearestNode(
-              position.coords.latitude,
-              position.coords.longitude,
-              scenicAreaId || undefined,
-            );
-            const matched =
-              optionRegistry.get(response.data.nodeId) || localOptions.find((item) => item.value === response.data.nodeId);
-            const option: SearchOption = matched
-              ? {
-                  ...matched,
-                  label: '当前位置',
-                  placeName: '当前位置',
-                  placeType: 'poi',
-                  latitude: position.coords.latitude,
-                  longitude: position.coords.longitude,
-                }
-              : {
-                  value: response.data.nodeId,
-                  label: '当前位置',
-                  placeName: '当前位置',
-                  placeType: 'poi',
-                  scenicAreaId,
-                  latitude: position.coords.latitude,
-                  longitude: position.coords.longitude,
-                };
-            resolve(option);
-          } catch (error) {
-            message.error(resolveErrorMessage(error, '获取当前位置失败，请稍后重试。'));
-            resolve(null);
-          }
-        },
-        () => {
-          message.warning('无法获取当前位置。');
-          resolve(null);
-        },
-        { timeout: 5000, maximumAge: 30000 },
-      );
-    });
+    return buildCurrentLocationOption(nextLocation.latitude, nextLocation.longitude);
+  };
+
+  const applyCurrentLocationAsStart = (option: SearchOption) => {
+    setSelectedStart(option);
+    setStartInput(option.placeName);
+    setStartOptions((current) => mergeOptions(current, option));
   };
 
   const handleUseCurrentLocation = async () => {
     const option = await getCurrentLocationOption();
     if (!option) return;
-    setSelectedStart(option);
-    setStartInput(option.placeName);
-    setStartOptions((current) => mergeOptions(current, option));
+    applyCurrentLocationAsStart(option);
     message.success('已将当前位置设置为起点。');
   };
+
+  const handleToggleCurrentLocationTracking = () => {
+    if (isWatchingCurrentLocation) {
+      stopWatching();
+      message.success('已停止实时跟踪起点。');
+      return;
+    }
+
+    const started = startWatching();
+    if (started) {
+      message.success('已开启实时跟踪，当前位置会持续同步到起点。');
+    } else {
+      message.warning({
+        key: 'path-current-location-error',
+        content: getLatestCurrentLocationError() || currentLocationError || '无法获取当前位置。',
+      });
+    }
+  };
+
+  useEffect(() => {
+    if (!currentLocation || !isWatchingCurrentLocation) {
+      return;
+    }
+
+    let cancelled = false;
+    const syncTrackedLocation = async () => {
+      const option = await buildCurrentLocationOption(currentLocation.latitude, currentLocation.longitude);
+      if (!option || cancelled) {
+        return;
+      }
+
+      applyCurrentLocationAsStart(option);
+    };
+
+    void syncTrackedLocation();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    currentLocation?.latitude,
+    currentLocation?.longitude,
+    isWatchingCurrentLocation,
+    localOptions,
+    message,
+    optionRegistry,
+    scenicAreaId,
+  ]);
 
   const handleAddTarget = async () => {
     const resolved = await resolveExactSelection(targetInput, null, targetOptions);
@@ -1229,7 +1291,48 @@ const PathPlanningPage: React.FC = () => {
   }, [routePaths]);
 
   const mapMarkers = useMemo(() => {
-    if (!routeLegs.length) return [] as Array<{ id: string; position: [number, number]; title: string; type?: string; label?: string }>;
+    if (!routeLegs.length) {
+      const previewMarkers: Array<{ id: string; position: [number, number]; title: string; type?: string; label?: string }> = [];
+
+      if (hasCoord(selectedStart?.latitude, selectedStart?.longitude)) {
+        previewMarkers.push({
+          id: 'draft-start',
+          position: [Number(selectedStart?.latitude), Number(selectedStart?.longitude)],
+          title: `当前起点：${selectedStart?.placeName || selectedStart?.label || '起点'}`,
+          type: 'start',
+          label: '起',
+        });
+      }
+
+      if (!multiPointMode && hasCoord(selectedEnd?.latitude, selectedEnd?.longitude)) {
+        previewMarkers.push({
+          id: 'draft-end',
+          position: [Number(selectedEnd?.latitude), Number(selectedEnd?.longitude)],
+          title: `当前终点：${selectedEnd?.placeName || selectedEnd?.label || '终点'}`,
+          type: 'end',
+          label: '终',
+        });
+      }
+
+      if (multiPointMode) {
+        selectedTargets.forEach((item, index) => {
+          if (!hasCoord(item.latitude, item.longitude)) {
+            return;
+          }
+
+          previewMarkers.push({
+            id: `draft-target-${item.value}`,
+            position: [Number(item.latitude), Number(item.longitude)],
+            title: `途经点 ${index + 1}：${item.placeName}`,
+            type: 'waypoint',
+            label: String(index + 1),
+          });
+        });
+      }
+
+      return previewMarkers;
+    }
+
     const markers: Array<{ id: string; position: [number, number]; title: string; type?: string; label?: string }> = [];
     const firstLeg = routePaths[0];
     const firstStartPoint =
@@ -1258,7 +1361,7 @@ const PathPlanningPage: React.FC = () => {
     });
 
     return markers;
-  }, [routeLegs, routePaths]);
+  }, [multiPointMode, routeLegs, routePaths, selectedEnd, selectedStart, selectedTargets]);
 
   const mapCenter = useMemo<[number, number]>(() => {
     const center = routeContext?.center;
@@ -1281,7 +1384,11 @@ const PathPlanningPage: React.FC = () => {
   );
   const mapFocusPoints = useMemo(() => {
     if (!activeTransportPlan || activePathIndex < 0) {
-      return activeLeg?.points || [];
+      if (activeLeg?.points?.length) {
+        return activeLeg.points;
+      }
+
+      return mapMarkers.map((item) => item.position);
     }
 
     const activePath = routePaths[activePathIndex];
@@ -1298,7 +1405,7 @@ const PathPlanningPage: React.FC = () => {
             [segment.toLocation.latitude, segment.toLocation.longitude] as [number, number],
           ],
     );
-  }, [activeLeg, activePathIndex, activeTransportPlan, routePaths]);
+  }, [activeLeg, activePathIndex, activeTransportPlan, mapMarkers, routePaths]);
   const noResultContent = <Text type="secondary">当前范围内暂无匹配地点</Text>;
 
   return (
@@ -1365,8 +1472,11 @@ const PathPlanningPage: React.FC = () => {
                 size="large"
               />
               <Space wrap style={{ marginTop: 12 }}>
-                <Button icon={<AimOutlined />} onClick={() => void handleUseCurrentLocation()}>
+                <Button icon={<AimOutlined />} loading={resolvingCurrentLocation} onClick={() => void handleUseCurrentLocation()}>
                   使用当前位置
+                </Button>
+                <Button type={isWatchingCurrentLocation ? 'primary' : 'default'} onClick={handleToggleCurrentLocationTracking}>
+                  {isWatchingCurrentLocation ? '停止实时跟踪' : '实时跟踪起点'}
                 </Button>
                 <Button
                   icon={<SwapOutlined />}
@@ -1383,6 +1493,13 @@ const PathPlanningPage: React.FC = () => {
                 >
                   交换起终点
                 </Button>
+              </Space>
+              <Space wrap style={{ marginTop: 8 }}>
+                {isWatchingCurrentLocation ? <Tag color="green">实时定位中</Tag> : null}
+                {currentLocation ? (
+                  <Tag color="blue">{`定位：${currentLocation.latitude.toFixed(5)}, ${currentLocation.longitude.toFixed(5)}`}</Tag>
+                ) : null}
+                {currentLocationError ? <Tag color="red">{currentLocationError}</Tag> : null}
               </Space>
             </Col>
             <Col xs={24} lg={13}>

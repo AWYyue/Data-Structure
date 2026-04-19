@@ -26,7 +26,6 @@ const SocialPage: React.FC = () => {
               回到景区查询
             </Button>
             <Button onClick={() => navigate('/diary')}>去看旅行日记</Button>
-            <Button onClick={() => navigate('/achievement')}>查看成就进度</Button>
           </Space>
         }
       />

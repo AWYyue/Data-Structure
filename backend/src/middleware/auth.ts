@@ -56,3 +56,34 @@ export const authMiddleware = async (req: Request, res: Response, next: NextFunc
     });
   }
 };
+
+export const optionalAuthMiddleware = async (req: Request, _res: Response, next: NextFunction) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    next();
+    return;
+  }
+
+  const token = authHeader.split(' ')[1];
+  if (!token) {
+    next();
+    return;
+  }
+
+  try {
+    const decoded = userService.verifyToken(token);
+    const resolvedUser = await userService.getUserByIdentity(decoded.userId, decoded.username);
+
+    if (resolvedUser) {
+      (req as any).user = {
+        userId: resolvedUser.id,
+        username: resolvedUser.username,
+      };
+    }
+  } catch {
+    // Ignore optional auth failures and continue as guest.
+  }
+
+  next();
+};

@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   App,
+  AutoComplete,
   Button,
   Card,
   Col,
@@ -11,14 +12,17 @@ import {
   List,
   Radio,
   Row,
+  Select,
   Skeleton,
   Space,
+  Spin,
   Tag,
   Typography,
 } from 'antd';
 import { AimOutlined, SearchOutlined } from '@ant-design/icons';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import PremiumPageHero from '../components/PremiumPageHero';
+import useCurrentLocation from '../hooks/useCurrentLocation';
 import queryService, { Attraction, Facility } from '../services/queryService';
 import { RootState, useAppDispatch, useAppSelector } from '../store';
 import { searchFacilities, searchFood, searchScenicAreas } from '../store/slices/querySlice';
@@ -29,6 +33,7 @@ const { Title, Text, Paragraph } = Typography;
 
 type SearchType = 'scenic' | 'facility' | 'food';
 type SearchFormValues = { keyword?: string };
+type ScenicSuggestionOption = { value: string };
 
 interface QueryCenter {
   name: string;
@@ -50,6 +55,7 @@ const typeLabelMap: Record<SearchType, string> = {
 };
 
 const radiusOptions = [0.3, 0.5, 0.8, 1.2];
+const scenicMinRatingOptions = [4.5, 4.0, 3.5];
 
 const scenicCardTone = [
   'linear-gradient(135deg, rgba(109,93,252,0.92), rgba(56,189,248,0.42))',
@@ -73,39 +79,111 @@ const QueryPage: React.FC = () => {
   const [scenicAreaName, setScenicAreaName] = useState('');
   const [centerPoint, setCenterPoint] = useState<QueryCenter | null>(null);
   const [radiusKm, setRadiusKm] = useState(0.5);
-  const [currentLocation, setCurrentLocation] = useState<QueryCenter | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadingExport, setLoadingExport] = useState(false);
   const [loadingImport, setLoadingImport] = useState(false);
+  const [selectedScenicCategories, setSelectedScenicCategories] = useState<string[]>([]);
+  const [minimumScenicRating, setMinimumScenicRating] = useState<number | null>(null);
+  const [scenicCategoryOptions, setScenicCategoryOptions] = useState<string[]>([]);
+  const [scenicSuggestions, setScenicSuggestions] = useState<ScenicSuggestionOption[]>([]);
+  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const dispatch = useAppDispatch();
   const navigate = useNavigate();
   const { message } = App.useApp();
   const { scenicAreas, facilities, foods, isLoading, error } = useAppSelector((state: RootState) => state.query);
+  const {
+    location: rawCurrentLocation,
+    error: currentLocationError,
+    isLoading: resolvingCurrentLocation,
+    requestLocation: requestCurrentLocation,
+    getLatestError: getLatestCurrentLocationError,
+  } = useCurrentLocation({
+    autoRequest: true,
+    enableHighAccuracy: true,
+    timeout: 5000,
+    maximumAge: 60000,
+  });
 
   const busy = loading || isLoading;
+  const scenicKeyword = Form.useWatch('keyword', form) || '';
+  const hasScenicFilterCriteria = selectedScenicCategories.length > 0 || minimumScenicRating !== null;
+  const currentLocationCenter = useMemo<QueryCenter | null>(
+    () =>
+      rawCurrentLocation
+        ? {
+            name: '当前位置',
+            latitude: rawCurrentLocation.latitude,
+            longitude: rawCurrentLocation.longitude,
+            source: 'current_location',
+          }
+        : null,
+    [rawCurrentLocation],
+  );
 
   useEffect(() => {
-    if (!navigator.geolocation) {
+    let cancelled = false;
+
+    const loadScenicCategories = async () => {
+      try {
+        const response = await queryService.getScenicAreaCategories();
+        if (!cancelled) {
+          const categories = Array.isArray(response.data) && response.data.length > 0 ? response.data : ['景区', '校园'];
+          setScenicCategoryOptions(categories);
+        }
+      } catch {
+        if (!cancelled) {
+          setScenicCategoryOptions(['景区', '校园']);
+        }
+      }
+    };
+
+    void loadScenicCategories();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (searchType !== 'scenic') {
+      setScenicSuggestions([]);
+      setLoadingSuggestions(false);
       return;
     }
 
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        setCurrentLocation({
-          name: '当前位置',
-          latitude: position.coords.latitude,
-          longitude: position.coords.longitude,
-          source: 'current_location',
-        });
-      },
-      () => {
-        setCurrentLocation(null);
-      },
-      { timeout: 4000, maximumAge: 60000 },
-    );
-  }, []);
+    const prefix = scenicKeyword.trim();
+    if (!prefix) {
+      setScenicSuggestions([]);
+      setLoadingSuggestions(false);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      setLoadingSuggestions(true);
+      try {
+        const response = await queryService.searchScenicAreaSuggestions(prefix, 8);
+        if (!cancelled) {
+          setScenicSuggestions((response.data || []).map((item) => ({ value: item })));
+        }
+      } catch {
+        if (!cancelled) {
+          setScenicSuggestions([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoadingSuggestions(false);
+        }
+      }
+    }, 240);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [scenicKeyword, searchType]);
 
   const results = useMemo(() => {
     if (searchType === 'scenic') return scenicAreas;
@@ -120,6 +198,8 @@ const QueryPage: React.FC = () => {
     nextScenicAreaName: string,
     nextCenter: QueryCenter | null,
     nextRadiusKm: number,
+    nextScenicCategories: string[] = selectedScenicCategories,
+    nextMinimumScenicRating: number | null = minimumScenicRating,
   ) => {
     const next = new URLSearchParams();
     next.set('mode', nextType);
@@ -131,6 +211,12 @@ const QueryPage: React.FC = () => {
       next.set('centerLat', String(nextCenter.latitude));
       next.set('centerLng', String(nextCenter.longitude));
       next.set('centerSource', nextCenter.source);
+    }
+    if (nextType === 'scenic') {
+      nextScenicCategories.forEach((category) => next.append('category', category));
+      if (typeof nextMinimumScenicRating === 'number') {
+        next.set('minRating', String(nextMinimumScenicRating));
+      }
     }
     if (nextType === 'facility') {
       next.set('radiusKm', String(nextRadiusKm));
@@ -144,17 +230,26 @@ const QueryPage: React.FC = () => {
     nextScenicAreaId = scenicAreaId,
     nextCenter = centerPoint,
     nextRadiusKm = radiusKm,
+    nextScenicCategories = selectedScenicCategories,
+    nextMinimumScenicRating = minimumScenicRating,
   ) => {
     const keyword = rawKeyword.trim();
     setLoading(true);
 
     try {
       if (type === 'scenic') {
-        if (!keyword) {
-          message.warning('请输入景区关键字。');
+        if (!keyword && nextScenicCategories.length === 0 && nextMinimumScenicRating === null) {
+          message.warning('请输入景区名称，或至少选择一个景区筛选条件。');
           return;
         }
-        await dispatch(searchScenicAreas({ query: keyword, limit: 24 })).unwrap();
+        await dispatch(
+          searchScenicAreas({
+            name: keyword || undefined,
+            categories: nextScenicCategories,
+            minRating: nextMinimumScenicRating ?? undefined,
+            limit: 24,
+          }),
+        ).unwrap();
         return;
       }
 
@@ -197,6 +292,8 @@ const QueryPage: React.FC = () => {
     const centerName = searchParams.get('centerName') || '';
     const centerSource = searchParams.get('centerSource') === 'current_location' ? 'current_location' : 'selected_place';
     const nextRadiusKm = parseNumber(searchParams.get('radiusKm')) || 0.5;
+    const nextScenicCategories = searchParams.getAll('category').filter(Boolean);
+    const nextMinimumScenicRating = parseNumber(searchParams.get('minRating'));
     const nextCenter: QueryCenter | null =
       centerLat !== null && centerLng !== null
         ? {
@@ -212,10 +309,24 @@ const QueryPage: React.FC = () => {
     setScenicAreaName(nextScenicAreaName);
     setCenterPoint(nextCenter);
     setRadiusKm(nextRadiusKm);
+    setSelectedScenicCategories(nextScenicCategories);
+    setMinimumScenicRating(nextMinimumScenicRating);
     form.setFieldsValue({ keyword });
 
-    if (keyword || (nextType === 'facility' && (nextScenicAreaId || nextCenter))) {
-      void runSearch(nextType, keyword, nextScenicAreaId, nextCenter, nextRadiusKm);
+    if (
+      keyword ||
+      (nextType === 'facility' && (nextScenicAreaId || nextCenter)) ||
+      (nextType === 'scenic' && (nextScenicCategories.length > 0 || nextMinimumScenicRating !== null))
+    ) {
+      void runSearch(
+        nextType,
+        keyword,
+        nextScenicAreaId,
+        nextCenter,
+        nextRadiusKm,
+        nextScenicCategories,
+        nextMinimumScenicRating,
+      );
     }
   }, [form, searchParams]);
 
@@ -232,67 +343,208 @@ const QueryPage: React.FC = () => {
       return '支持按菜系、店名和关键字检索美食，并继续跳转到景区美食页、旅行日记和导航模块。';
     }
 
-    return '先找到目标景区或校园，再继续进入详情、附近设施、户外导航和一日计划，形成一条龙游览体验。';
+    return '支持景区名称前缀联想、类别过滤和最低评分筛选；输入名称时会优先走 Trie 前缀检索，再继续进入详情、附近设施和导航模块。';
   }, [centerPoint, radiusKm, scenicAreaName, searchType]);
 
   const resultSummaryText =
     searchType === 'scenic'
-      ? '这里会展示匹配到的景区与校园，你可以继续进入详情，或者以某个结果为中心查附近设施。'
+      ? '这里会展示符合名称前缀、类别和评分条件的景区结果；你可以继续进入详情，或者以某个结果为中心查附近设施。'
       : searchType === 'facility'
       ? '设施结果会优先按真实路网距离排序；如果路网不可用，才回退到直线距离。'
       : '找到美食后，可以继续进入景区详情、美食推荐页和旅行日记。';
 
   const handleSubmit = async (values: SearchFormValues) => {
     const keyword = (values.keyword || '').trim();
-    syncSearchParams(searchType, keyword, scenicAreaId, scenicAreaName, centerPoint, radiusKm);
-    await runSearch(searchType, keyword, scenicAreaId, centerPoint, radiusKm);
+    syncSearchParams(
+      searchType,
+      keyword,
+      scenicAreaId,
+      scenicAreaName,
+      centerPoint,
+      radiusKm,
+      selectedScenicCategories,
+      minimumScenicRating,
+    );
+    await runSearch(
+      searchType,
+      keyword,
+      scenicAreaId,
+      centerPoint,
+      radiusKm,
+      selectedScenicCategories,
+      minimumScenicRating,
+    );
   };
 
   const handleQuickKeyword = async (keyword: string) => {
     form.setFieldsValue({ keyword });
-    syncSearchParams(searchType, keyword, scenicAreaId, scenicAreaName, centerPoint, radiusKm);
-    await runSearch(searchType, keyword, scenicAreaId, centerPoint, radiusKm);
+    syncSearchParams(
+      searchType,
+      keyword,
+      scenicAreaId,
+      scenicAreaName,
+      centerPoint,
+      radiusKm,
+      selectedScenicCategories,
+      minimumScenicRating,
+    );
+    await runSearch(
+      searchType,
+      keyword,
+      scenicAreaId,
+      centerPoint,
+      radiusKm,
+      selectedScenicCategories,
+      minimumScenicRating,
+    );
   };
 
   const handleSearchTypeChange = (value: SearchType) => {
     setSearchType(value);
     const keyword = form.getFieldValue('keyword') || '';
-    syncSearchParams(value, keyword, scenicAreaId, scenicAreaName, centerPoint, radiusKm);
+    syncSearchParams(
+      value,
+      keyword,
+      scenicAreaId,
+      scenicAreaName,
+      centerPoint,
+      radiusKm,
+      selectedScenicCategories,
+      minimumScenicRating,
+    );
   };
 
   const handleUseCurrentLocationAsCenter = async () => {
-    if (!currentLocation) {
-      message.warning('当前无法获取定位，请稍后再试。');
-      return;
+    let nextCenter = currentLocationCenter;
+    if (!nextCenter) {
+      const nextLocation = await requestCurrentLocation();
+      if (!nextLocation) {
+        message.warning({
+          key: 'query-current-location-error',
+          content: getLatestCurrentLocationError() || currentLocationError || '当前位置获取失败，请检查浏览器定位权限。',
+        });
+        return;
+      }
+
+      nextCenter = {
+        name: '当前位置',
+        latitude: nextLocation.latitude,
+        longitude: nextLocation.longitude,
+        source: 'current_location',
+      };
     }
 
-    setCenterPoint(currentLocation);
+    setCenterPoint(nextCenter);
     const keyword = form.getFieldValue('keyword') || '';
-    syncSearchParams(searchType, keyword, scenicAreaId, scenicAreaName, currentLocation, radiusKm);
+    syncSearchParams(
+      searchType,
+      keyword,
+      scenicAreaId,
+      scenicAreaName,
+      nextCenter,
+      radiusKm,
+      selectedScenicCategories,
+      minimumScenicRating,
+    );
     if (searchType === 'facility') {
-      await runSearch('facility', keyword, scenicAreaId, currentLocation, radiusKm);
+      await runSearch('facility', keyword, scenicAreaId, nextCenter, radiusKm);
     }
   };
 
   const handleClearCenter = () => {
     setCenterPoint(null);
     const keyword = form.getFieldValue('keyword') || '';
-    syncSearchParams(searchType, keyword, scenicAreaId, scenicAreaName, null, radiusKm);
+    syncSearchParams(
+      searchType,
+      keyword,
+      scenicAreaId,
+      scenicAreaName,
+      null,
+      radiusKm,
+      selectedScenicCategories,
+      minimumScenicRating,
+    );
   };
 
   const handleClearScenicScope = () => {
     setScenicAreaId('');
     setScenicAreaName('');
     const keyword = form.getFieldValue('keyword') || '';
-    syncSearchParams(searchType, keyword, '', '', centerPoint, radiusKm);
+    syncSearchParams(
+      searchType,
+      keyword,
+      '',
+      '',
+      centerPoint,
+      radiusKm,
+      selectedScenicCategories,
+      minimumScenicRating,
+    );
   };
 
   const handleRadiusChange = async (nextRadius: number) => {
     setRadiusKm(nextRadius);
     const keyword = form.getFieldValue('keyword') || '';
-    syncSearchParams(searchType, keyword, scenicAreaId, scenicAreaName, centerPoint, nextRadius);
+    syncSearchParams(
+      searchType,
+      keyword,
+      scenicAreaId,
+      scenicAreaName,
+      centerPoint,
+      nextRadius,
+      selectedScenicCategories,
+      minimumScenicRating,
+    );
     if (searchType === 'facility' && (keyword || scenicAreaId || centerPoint)) {
       await runSearch('facility', keyword, scenicAreaId, centerPoint, nextRadius);
+    }
+  };
+
+  const handleScenicCategoryChange = async (nextCategories: string[]) => {
+    setSelectedScenicCategories(nextCategories);
+    const keyword = form.getFieldValue('keyword') || '';
+    syncSearchParams(
+      searchType,
+      keyword,
+      scenicAreaId,
+      scenicAreaName,
+      centerPoint,
+      radiusKm,
+      nextCategories,
+      minimumScenicRating,
+    );
+    if (searchType === 'scenic' && (keyword.trim() || nextCategories.length > 0 || minimumScenicRating !== null)) {
+      await runSearch('scenic', keyword, scenicAreaId, centerPoint, radiusKm, nextCategories, minimumScenicRating);
+    }
+  };
+
+  const handleScenicMinRatingChange = async (nextMinimumRating: number | null) => {
+    setMinimumScenicRating(nextMinimumRating);
+    const keyword = form.getFieldValue('keyword') || '';
+    syncSearchParams(
+      searchType,
+      keyword,
+      scenicAreaId,
+      scenicAreaName,
+      centerPoint,
+      radiusKm,
+      selectedScenicCategories,
+      nextMinimumRating,
+    );
+    if (searchType === 'scenic' && (keyword.trim() || selectedScenicCategories.length > 0 || nextMinimumRating !== null)) {
+      await runSearch('scenic', keyword, scenicAreaId, centerPoint, radiusKm, selectedScenicCategories, nextMinimumRating);
+    }
+  };
+
+  const handleClearScenicFilters = async () => {
+    setSelectedScenicCategories([]);
+    setMinimumScenicRating(null);
+    const keyword = form.getFieldValue('keyword') || '';
+    syncSearchParams(searchType, keyword, scenicAreaId, scenicAreaName, centerPoint, radiusKm, [], null);
+    if (searchType === 'scenic') {
+      if (keyword.trim()) {
+        await runSearch('scenic', keyword, scenicAreaId, centerPoint, radiusKm, [], null);
+      }
     }
   };
 
@@ -480,20 +732,35 @@ const QueryPage: React.FC = () => {
                 rules={
                   searchType === 'facility' && (scenicAreaId || centerPoint)
                     ? []
+                    : searchType === 'scenic' && hasScenicFilterCriteria
+                    ? []
                     : [{ required: true, whitespace: true, message: '请输入查询关键字。' }]
                 }
               >
-                <Input
-                  allowClear
-                  prefix={<SearchOutlined />}
-                  placeholder={
-                    searchType === 'scenic'
-                      ? '例如：校园、古镇、博物馆'
-                      : searchType === 'facility'
-                      ? '例如：卫生间、游客中心、便利店'
-                      : '例如：小吃、咖啡、特色餐厅'
-                  }
-                />
+                {searchType === 'scenic' ? (
+                  <AutoComplete
+                    allowClear
+                    options={scenicSuggestions}
+                    onSelect={(value) => form.setFieldValue('keyword', value)}
+                    notFoundContent={loadingSuggestions ? <Spin size="small" /> : null}
+                  >
+                    <Input
+                      allowClear
+                      prefix={<SearchOutlined />}
+                      placeholder="例如：北京大学、古镇、校园"
+                    />
+                  </AutoComplete>
+                ) : (
+                  <Input
+                    allowClear
+                    prefix={<SearchOutlined />}
+                    placeholder={
+                      searchType === 'facility'
+                        ? '例如：卫生间、游客中心、便利店'
+                        : '例如：小吃、咖啡、特色餐厅'
+                    }
+                  />
+                )}
               </Form.Item>
             </Col>
             <Col xs={24} lg={6} style={{ display: 'flex', alignItems: 'flex-end' }}>
@@ -526,6 +793,40 @@ const QueryPage: React.FC = () => {
             ))}
           </Space>
 
+          {searchType === 'scenic' ? (
+            <Space wrap align="start">
+              <Space direction="vertical" size={6}>
+                <Text strong>景区类别</Text>
+                <Select
+                  mode="multiple"
+                  allowClear
+                  placeholder="选择类别后可直接筛选"
+                  style={{ width: 260 }}
+                  value={selectedScenicCategories}
+                  options={scenicCategoryOptions.map((item) => ({ label: item, value: item }))}
+                  onChange={(values) => void handleScenicCategoryChange(values)}
+                />
+              </Space>
+              <Space direction="vertical" size={6}>
+                <Text strong>最低评分</Text>
+                <Select
+                  allowClear
+                  placeholder="不限评分"
+                  style={{ width: 180 }}
+                  value={minimumScenicRating}
+                  options={scenicMinRatingOptions.map((item) => ({
+                    label: `${item.toFixed(1)} 分及以上`,
+                    value: item,
+                  }))}
+                  onChange={(value) => void handleScenicMinRatingChange(value ?? null)}
+                />
+              </Space>
+              {hasScenicFilterCriteria ? (
+                <Button onClick={() => void handleClearScenicFilters()}>清除景区筛选</Button>
+              ) : null}
+            </Space>
+          ) : null}
+
           {searchType === 'facility' ? (
             <Space wrap>
               <Text strong>查询范围：</Text>
@@ -545,11 +846,22 @@ const QueryPage: React.FC = () => {
           <Space wrap>
             {centerPoint ? <Tag color="gold">当前中心点：{centerPoint.name}</Tag> : null}
             {scenicAreaName ? <Tag color="blue">当前景区范围：{scenicAreaName}</Tag> : null}
-            {currentLocation ? (
-              <Button icon={<AimOutlined />} onClick={() => void handleUseCurrentLocationAsCenter()}>
-                使用当前位置作为中心点
-              </Button>
+            {selectedScenicCategories.map((category) => (
+              <Tag key={category} color="purple">
+                类别：{category}
+              </Tag>
+            ))}
+            {typeof minimumScenicRating === 'number' ? (
+              <Tag color="magenta">最低评分：{minimumScenicRating.toFixed(1)}</Tag>
             ) : null}
+            {currentLocationError ? <Tag color="red">{currentLocationError}</Tag> : null}
+            <Button
+              icon={<AimOutlined />}
+              loading={resolvingCurrentLocation}
+              onClick={() => void handleUseCurrentLocationAsCenter()}
+            >
+              使用当前位置作为中心点
+            </Button>
             {centerPoint ? <Button onClick={handleClearCenter}>清除中心点</Button> : null}
             {scenicAreaName ? <Button onClick={handleClearScenicScope}>清除景区范围</Button> : null}
           </Space>

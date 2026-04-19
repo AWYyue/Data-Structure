@@ -1,6 +1,5 @@
 import { Entity, PrimaryGeneratedColumn, Column, OneToMany, CreateDateColumn, UpdateDateColumn } from 'typeorm';
 import { UserBehavior } from './UserBehavior';
-import { Achievement } from './Achievement';
 import { Diary } from './Diary';
 import { stringArrayJsonTransformer } from '../utils/stringArrayField';
 
@@ -22,7 +21,7 @@ export class User {
   interests: string[] = [];
 
   @Column({ type: 'json', nullable: true })
-  interestWeights: any = {};
+  interestWeights: Record<string, number> = {};
 
   @Column({ type: 'text', nullable: true, transformer: stringArrayJsonTransformer })
   viewedItems: string[] = [];
@@ -35,9 +34,6 @@ export class User {
 
   @OneToMany(() => UserBehavior, behavior => behavior.user)
   behaviors!: UserBehavior[];
-
-  @OneToMany(() => Achievement, achievement => achievement.user)
-  achievements!: Achievement[];
 
   @OneToMany(() => Diary, diary => diary.user)
   diaries!: Diary[];

@@ -1,10 +1,12 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   App as AntdApp,
+  AutoComplete,
   Avatar,
   Button,
   ConfigProvider,
   Drawer,
+  Dropdown,
   Input,
   Layout,
   Menu,
@@ -20,23 +22,27 @@ import {
   AimOutlined,
   BookOutlined,
   CompassOutlined,
+  DownOutlined,
   EnvironmentOutlined,
   GiftOutlined,
   HomeOutlined,
+  LogoutOutlined,
   MenuOutlined,
   NotificationOutlined,
   SearchOutlined,
+  SettingOutlined,
+  SwapOutlined,
   TeamOutlined,
-  TrophyOutlined,
   UserOutlined,
 } from '@ant-design/icons';
 import { BrowserRouter as Router, Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
+import queryService from './services/queryService';
 import { useAppDispatch, useAppSelector } from './store';
 import { getCurrentUser, logout } from './store/slices/userSlice';
 
 const HomePage = React.lazy(() => import('./pages/HomePage'));
-const LoginPage = React.lazy(() => import('./pages/LoginPage'));
-const RegisterPage = React.lazy(() => import('./pages/RegisterPage'));
+const LoginPage = React.lazy(() => import('./pages/AccountLoginPage'));
+const RegisterPage = React.lazy(() => import('./pages/AccountRegisterPage'));
 const JourneyPlannerPage = React.lazy(() => import('./pages/JourneyPlannerPage'));
 const PathPlanningPage = React.lazy(() => import('./pages/PathPlanningPage'));
 const QueryPage = React.lazy(() => import('./pages/QueryPage'));
@@ -47,7 +53,7 @@ const IndoorNavigationPage = React.lazy(() => import('./pages/IndoorNavigationPa
 const FoodRecommendationPage = React.lazy(() => import('./pages/FoodRecommendationPage'));
 const ReminderPage = React.lazy(() => import('./pages/ReminderPage'));
 const SocialPage = React.lazy(() => import('./pages/SocialPage'));
-const AchievementPage = React.lazy(() => import('./pages/AchievementPage'));
+const ProfilePage = React.lazy(() => import('./pages/ProfilePage'));
 
 import './App.css';
 
@@ -55,6 +61,7 @@ const { Header, Content, Footer, Sider } = Layout;
 const { Text } = Typography;
 
 type ColorMode = 'light' | 'dark';
+type HeaderSuggestionOption = { value: string };
 
 const routeKeyMap: Record<string, string> = {
   '/': 'home',
@@ -66,20 +73,20 @@ const routeKeyMap: Record<string, string> = {
   '/diary': 'diary',
   '/reminder': 'reminder',
   '/social': 'social',
-  '/achievement': 'achievement',
+  '/profile': 'profile',
 };
 
 const routeMetaMap: Record<string, { title: string; subtitle: string }> = {
   home: { title: '首页总览', subtitle: '从推荐、榜单和主流程入口开始。' },
-  journey: { title: '智能行程', subtitle: '兴趣采集、目的地推荐与一日计划。' },
-  query: { title: '景区与设施查询', subtitle: '把景区、设施、美食检索放在一个工作区里。' },
-  overview: { title: '景区总览', subtitle: '承接首页推荐更多，集中浏览前十推荐与更多目的地。' },
-  path: { title: '户外路径规划', subtitle: '衔接景区上下文与分段导航执行。' },
-  indoor: { title: '室内导航', subtitle: '入口到房间、楼层切换与室内路径展示。' },
-  diary: { title: '旅行日记', subtitle: '内容沉浸、社区浏览、全文检索与 AIGC 动画。' },
-  reminder: { title: '个性提醒', subtitle: '天气、人流、弱网和行程提醒的集中入口。' },
-  social: { title: '社交互动', subtitle: '热点、附近游客、组队和签到打卡。' },
-  achievement: { title: '成就系统', subtitle: '进度累计、解锁记录与行为反馈。' },
+  journey: { title: '智能行程', subtitle: '兴趣采集、目的地推荐与一日路线规划。' },
+  query: { title: '景区与设施查询', subtitle: '把景区、设施、美食检索放在同一个工作区。' },
+  overview: { title: '景区总览', subtitle: '集中浏览热门景区和推荐目的地。' },
+  path: { title: '路线规划', subtitle: '连接景区上下文与导航执行。' },
+  indoor: { title: '室内导航', subtitle: '楼层切换、入口引导和室内路线展示。' },
+  diary: { title: '旅行日记', subtitle: '浏览内容、沉浸记录与全文检索。' },
+  reminder: { title: '个性提醒', subtitle: '天气、人流和行程相关提醒入口。' },
+  social: { title: '社交互动', subtitle: '打卡、组队和附近游客互动。' },
+  profile: { title: '账号设置', subtitle: '维护账号信息、密码与兴趣偏好。' },
 };
 
 const AppLoadingFallback: React.FC = () => (
@@ -93,16 +100,52 @@ const AppShell: React.FC = () => {
   const dispatch = useAppDispatch();
   const location = useLocation();
   const navigate = useNavigate();
-  const { user, token, isLoading } = useAppSelector((state) => state.user);
+  const { user, token } = useAppSelector((state) => state.user);
 
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [mode, setMode] = useState<ColorMode>(() => (localStorage.getItem('color-mode') === 'dark' ? 'dark' : 'light'));
+  const [headerSearchKeyword, setHeaderSearchKeyword] = useState('');
+  const [headerSuggestionOptions, setHeaderSuggestionOptions] = useState<HeaderSuggestionOption[]>([]);
+  const [headerSuggestionLoading, setHeaderSuggestionLoading] = useState(false);
 
   useEffect(() => {
-    if (token && !user && !isLoading) {
+    if (token) {
       void dispatch(getCurrentUser());
     }
-  }, [dispatch, isLoading, token, user]);
+  }, [dispatch, token]);
+
+  useEffect(() => {
+    const keyword = headerSearchKeyword.trim();
+    if (!keyword) {
+      setHeaderSuggestionOptions([]);
+      setHeaderSuggestionLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      setHeaderSuggestionLoading(true);
+      try {
+        const response = await queryService.searchScenicAreaSuggestions(keyword, 8);
+        if (!cancelled) {
+          setHeaderSuggestionOptions((response.data || []).map((item) => ({ value: item })));
+        }
+      } catch {
+        if (!cancelled) {
+          setHeaderSuggestionOptions([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setHeaderSuggestionLoading(false);
+        }
+      }
+    }, 220);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [headerSearchKeyword]);
 
   const selectedKey = useMemo(() => {
     const direct = routeKeyMap[location.pathname];
@@ -115,15 +158,39 @@ const AppShell: React.FC = () => {
     return 'home';
   }, [location.pathname]);
 
-  const currentMeta = routeMetaMap[selectedKey] || routeMetaMap.home;
   const menuSelectedKey = selectedKey === 'overview' ? 'query' : selectedKey;
+  const currentMeta = routeMetaMap[selectedKey] || routeMetaMap.home;
   const needsOnboarding = Boolean(user && (!user.interests || user.interests.length === 0));
   const authLanding = needsOnboarding ? '/journey' : '/';
 
-  const handleLogout = () => {
+  const submitHeaderSearch = (rawKeyword?: string) => {
+    const keyword = (rawKeyword ?? headerSearchKeyword).trim();
+    setMobileMenuOpen(false);
+    if (!keyword) {
+      navigate('/query');
+      return;
+    }
+
+    navigate(`/query?mode=scenic&keyword=${encodeURIComponent(keyword)}`);
+  };
+
+  const handleLogout = (target: 'home' | 'login' = 'login') => {
     dispatch(logout());
     setMobileMenuOpen(false);
-    navigate('/login', { replace: true });
+    setHeaderSearchKeyword('');
+    setHeaderSuggestionOptions([]);
+    navigate(target === 'home' ? '/' : '/login', { replace: true });
+  };
+
+  const handleGuestClick = () => {
+    navigate('/login');
+  };
+
+  const handleGuestKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      handleGuestClick();
+    }
   };
 
   const menuItems: MenuProps['items'] = [
@@ -135,7 +202,32 @@ const AppShell: React.FC = () => {
     { key: 'diary', icon: <BookOutlined />, label: <Link to="/diary">旅行日记</Link> },
     { key: 'reminder', icon: <NotificationOutlined />, label: <Link to="/reminder">个性提醒</Link> },
     { key: 'social', icon: <TeamOutlined />, label: <Link to="/social">社交互动</Link> },
-    { key: 'achievement', icon: <TrophyOutlined />, label: <Link to="/achievement">成就系统</Link> },
+  ];
+
+  const navigationItems = user
+    ? [
+        ...menuItems,
+        { key: 'profile', icon: <SettingOutlined />, label: <Link to="/profile">账号设置</Link> },
+      ]
+    : menuItems;
+
+  const headerUserMenuItems: MenuProps['items'] = [
+    {
+      key: 'profile',
+      icon: <SettingOutlined />,
+      label: '账号设置',
+    },
+    {
+      key: 'switch',
+      icon: <SwapOutlined />,
+      label: '切换账号',
+    },
+    {
+      key: 'logout',
+      icon: <LogoutOutlined />,
+      label: '退出登录',
+      danger: true,
+    },
   ];
 
   const appTheme = useMemo(() => {
@@ -176,7 +268,7 @@ const AppShell: React.FC = () => {
               </div>
             </div>
 
-            <Menu mode="inline" selectedKeys={[menuSelectedKey]} items={menuItems} className="sidebar-menu" />
+            <Menu mode="inline" selectedKeys={[menuSelectedKey]} items={navigationItems} className="sidebar-menu" />
 
             <div className="sidebar-footer">
               {user ? (
@@ -185,11 +277,13 @@ const AppShell: React.FC = () => {
                     <Avatar size={42} icon={<UserOutlined />} />
                     <div>
                       <div className="sidebar-user-name">{user.username || '当前用户'}</div>
-                      <div className="sidebar-user-subtitle">{needsOnboarding ? '待完善兴趣画像' : '个性化服务已开启'}</div>
+                      <div className="sidebar-user-subtitle">
+                        {needsOnboarding ? '待完善兴趣画像' : '个性化服务已开启'}
+                      </div>
                     </div>
                   </Space>
-                  <Button danger block onClick={handleLogout}>
-                    退出登录
+                  <Button danger block onClick={() => handleLogout('login')}>
+                    退出登录 / 切换账号
                   </Button>
                 </div>
               ) : (
@@ -219,7 +313,24 @@ const AppShell: React.FC = () => {
 
               <div className="workspace-header-right">
                 <div className="desktop-only workspace-search">
-                  <Input prefix={<SearchOutlined />} placeholder="搜索景区、设施、美食、旅行日记" allowClear />
+                  <AutoComplete
+                    value={headerSearchKeyword}
+                    options={headerSuggestionOptions}
+                    onChange={setHeaderSearchKeyword}
+                    onSelect={(value) => {
+                      setHeaderSearchKeyword(value);
+                      submitHeaderSearch(value);
+                    }}
+                    notFoundContent={headerSuggestionLoading ? <Spin size="small" /> : null}
+                  >
+                    <Input.Search
+                      allowClear
+                      enterButton
+                      prefix={<SearchOutlined />}
+                      placeholder="搜索景区名称，支持前缀联想"
+                      onSearch={submitHeaderSearch}
+                    />
+                  </AutoComplete>
                 </div>
                 <Tooltip title={mode === 'dark' ? '切换为浅色模式' : '切换为深色模式'}>
                   <Switch
@@ -231,25 +342,68 @@ const AppShell: React.FC = () => {
                     }}
                   />
                 </Tooltip>
-                <div className="header-user-chip">
-                  <Avatar size={34} icon={<UserOutlined />} />
-                  <div className="desktop-only">
-                    <div className="header-user-name">{user?.username || '访客'}</div>
-                    <Text type="secondary" style={{ fontSize: 12 }}>
-                      {user ? (needsOnboarding ? '待完成兴趣设置' : '已登录') : '未登录'}
-                    </Text>
+
+                {user ? (
+                  <Dropdown
+                    trigger={['click']}
+                    menu={{
+                      items: headerUserMenuItems,
+                      onClick: ({ key }) => {
+                        if (key === 'profile') {
+                          navigate('/profile');
+                          return;
+                        }
+                        if (key === 'switch') {
+                          handleLogout('login');
+                          return;
+                        }
+                        handleLogout('home');
+                      },
+                    }}
+                  >
+                    <div className="header-user-chip header-user-chip-dropdown" role="button" tabIndex={0}>
+                      <Avatar size={34} icon={<UserOutlined />} />
+                      <div className="desktop-only">
+                        <div className="header-user-name">{user.username || '已登录用户'}</div>
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          {needsOnboarding ? '待完善兴趣设置' : '已登录'}
+                        </Text>
+                      </div>
+                      <DownOutlined className="header-user-arrow desktop-only" />
+                    </div>
+                  </Dropdown>
+                ) : (
+                  <div
+                    className="header-user-chip"
+                    onClick={handleGuestClick}
+                    onKeyDown={handleGuestKeyDown}
+                    role="button"
+                    tabIndex={0}
+                  >
+                    <Avatar size={34} icon={<UserOutlined />} />
+                    <div className="desktop-only">
+                      <div className="header-user-name">访客</div>
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        未登录
+                      </Text>
+                    </div>
                   </div>
-                </div>
+                )}
               </div>
             </Header>
 
             <Drawer open={mobileMenuOpen} onClose={() => setMobileMenuOpen(false)} placement="left" title="个性化旅游系统">
-              <Menu mode="vertical" selectedKeys={[menuSelectedKey]} items={menuItems} onClick={() => setMobileMenuOpen(false)} />
+              <Menu mode="vertical" selectedKeys={[menuSelectedKey]} items={navigationItems} onClick={() => setMobileMenuOpen(false)} />
               <div style={{ marginTop: 16 }}>
                 {user ? (
-                  <Button danger block onClick={handleLogout}>
-                    退出登录
-                  </Button>
+                  <Space direction="vertical" style={{ width: '100%' }}>
+                    <Button block onClick={() => navigate('/profile')}>
+                      账号设置
+                    </Button>
+                    <Button danger block onClick={() => handleLogout('login')}>
+                      退出登录 / 切换账号
+                    </Button>
+                  </Space>
                 ) : (
                   <Space direction="vertical" style={{ width: '100%' }}>
                     <Button type="primary" block onClick={() => navigate('/login')}>
@@ -269,7 +423,7 @@ const AppShell: React.FC = () => {
                   <Route path="/" element={needsOnboarding ? <Navigate to="/journey" replace /> : <HomePage />} />
                   <Route path="/login" element={user ? <Navigate to={authLanding} replace /> : <LoginPage />} />
                   <Route path="/register" element={user ? <Navigate to={authLanding} replace /> : <RegisterPage />} />
-                  <Route path="/journey" element={user ? <JourneyPlannerPage /> : <Navigate to="/login" replace />} />
+                  <Route path="/journey" element={<JourneyPlannerPage />} />
                   <Route path="/path-planning" element={<PathPlanningPage />} />
                   <Route path="/query" element={<QueryPage />} />
                   <Route path="/scenic-overview" element={<ScenicOverviewPage />} />
@@ -279,12 +433,12 @@ const AppShell: React.FC = () => {
                   <Route path="/food-recommendation/:scenicAreaId" element={<FoodRecommendationPage />} />
                   <Route path="/reminder" element={<ReminderPage />} />
                   <Route path="/social" element={<SocialPage />} />
-                  <Route path="/achievement" element={<AchievementPage />} />
+                  <Route path="/profile" element={user ? <ProfilePage /> : <Navigate to="/login" replace />} />
                 </Routes>
               </React.Suspense>
             </Content>
 
-            <Footer className="workspace-footer">面向数据结构课设的一体化智能旅游系统</Footer>
+            <Footer className="workspace-footer">面向数据结构课程设计的一体化智能旅游系统</Footer>
           </Layout>
         </Layout>
       </AntdApp>

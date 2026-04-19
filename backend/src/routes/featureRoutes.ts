@@ -19,9 +19,7 @@ router.post('/photo-checkin', authMiddleware, async (req, res) => {
     res.status(201).json({
       success: result.success,
       message: result.message,
-      data: {
-        achievement: result.achievement
-      }
+      data: {}
     });
   } catch (error: any) {
     res.status(400).json({

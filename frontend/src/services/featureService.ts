@@ -1,8 +1,6 @@
 import api from './api';
 import { Food, Reminder } from '../types';
 
-type PhotoCheckinAchievement = Record<string, unknown>;
-
 export const featureService = {
   createPhotoCheckin: async (data: {
     attractionId: string;
@@ -12,7 +10,7 @@ export const featureService = {
   }): Promise<{
     success: boolean;
     message: string;
-    data: { achievement?: PhotoCheckinAchievement };
+    data: Record<string, never>;
   }> => api.post('/features/photo-checkin', data),
 
   getFoodRecommendations: async (

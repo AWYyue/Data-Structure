@@ -1,7 +1,6 @@
 import path from 'path';
 import { DataSource, DataSourceOptions, In, Like } from 'typeorm';
 import dotenv from 'dotenv';
-import { Achievement } from '../entities/Achievement';
 import { Attraction } from '../entities/Attraction';
 import { Diary } from '../entities/Diary';
 import { DiaryComment } from '../entities/DiaryComment';
@@ -39,9 +38,7 @@ const createCommonOptions = () => {
   const rootDir = path.resolve(__dirname, '..');
 
   return {
-    entities: [
-      Achievement,
-      Attraction,
+    entities: [      Attraction,
       Diary,
       DiaryComment,
       Facility,

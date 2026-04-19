@@ -38,14 +38,13 @@ const normalizeStringArray = (value: unknown): string[] => {
 // 用户注册
 router.post('/register', async (req, res) => {
   try {
-    const { username, email, password } = req.body;
-    const user = await userService.register({ username, email, password });
+    const { username, password } = req.body;
+    const user = await userService.register({ username, password });
     res.status(201).json({
       success: true,
       data: {
         id: user.id,
         username: user.username,
-        email: user.email,
         createdAt: user.createdAt
       }
     });
@@ -71,7 +70,11 @@ router.post('/login', async (req, res) => {
         user: {
           id: user.id,
           username: user.username,
-          email: user.email
+          interests: normalizeStringArray(user.interests),
+          interestWeights: user.interestWeights,
+          favorites: normalizeStringArray(user.favorites),
+          createdAt: user.createdAt,
+          updatedAt: user.updatedAt
         },
         token
       }
@@ -106,11 +109,11 @@ router.get('/me', authMiddleware, async (req, res) => {
       data: {
         id: user.id,
         username: user.username,
-        email: user.email,
         interests: normalizeStringArray(user.interests),
         interestWeights: user.interestWeights,
         favorites: normalizeStringArray(user.favorites),
-        createdAt: user.createdAt
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt
       }
     });
   } catch (error: any) {
@@ -120,6 +123,31 @@ router.get('/me', authMiddleware, async (req, res) => {
         code: 'INTERNAL_ERROR',
         message: error.message
       }
+    });
+  }
+});
+
+router.put('/password', authMiddleware, async (req, res) => {
+  try {
+    const userId = (req as any).user.userId;
+    const { currentPassword, newPassword } = req.body;
+    const user = await userService.updatePassword(userId, currentPassword, newPassword);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        id: user.id,
+        username: user.username,
+        updatedAt: user.updatedAt,
+      },
+    });
+  } catch (error: any) {
+    res.status(400).json({
+      success: false,
+      error: {
+        code: 'PASSWORD_UPDATE_FAILED',
+        message: error.message,
+      },
     });
   }
 });

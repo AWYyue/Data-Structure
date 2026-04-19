@@ -26,9 +26,15 @@ api.interceptors.request.use(
 api.interceptors.response.use(
   (response) => response.data,
   (error) => {
-    if (error.response?.status === 401) {
+    const requestUrl = String(error.config?.url || '');
+    const shouldHandleUnauthorized =
+      error.response?.status === 401 &&
+      !requestUrl.includes('/users/login') &&
+      !requestUrl.includes('/users/register');
+    const shouldHandleMissingCurrentUser = error.response?.status === 404 && requestUrl.includes('/users/me');
+
+    if (shouldHandleUnauthorized || shouldHandleMissingCurrentUser) {
       clearStoredAuth();
-      window.location.href = '/login';
     }
     return Promise.reject(error);
   },

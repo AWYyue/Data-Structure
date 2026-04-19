@@ -5,6 +5,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import MapComponent from '../components/MapComponent';
 import PhotoSpotComponent from '../components/PhotoSpotComponent';
 import PremiumPageHero from '../components/PremiumPageHero';
+import useCurrentLocation from '../hooks/useCurrentLocation';
 import pathPlanningService, { RoadNetworkEdge, RoadNetworkNode } from '../services/pathPlanningService';
 import queryService, { Facility, ScenicAreaDetails } from '../services/queryService';
 import { resolveErrorMessage } from '../utils/errorMessage';
@@ -62,8 +63,21 @@ const ScenicAreaDetailPage: React.FC = () => {
   const [nearbyRadiusKm, setNearbyRadiusKm] = useState(0.8);
   const [loadingNearbyFacilities, setLoadingNearbyFacilities] = useState(false);
   const [nearbyError, setNearbyError] = useState<string | null>(null);
-  const [resolvingCurrentLocation, setResolvingCurrentLocation] = useState(false);
   const [focusedNearbyFacilityId, setFocusedNearbyFacilityId] = useState<string | null>(null);
+  const {
+    location: currentLocation,
+    error: currentLocationError,
+    isLoading: resolvingCurrentLocation,
+    isWatching: isWatchingCurrentLocation,
+    requestLocation,
+    startWatching,
+    stopWatching,
+    getLatestError: getLatestCurrentLocationError,
+  } = useCurrentLocation({
+    enableHighAccuracy: true,
+    timeout: 8000,
+    maximumAge: 60000,
+  });
 
   useEffect(() => {
     if (!id) {
@@ -132,6 +146,15 @@ const ScenicAreaDetailPage: React.FC = () => {
       setLoadingNearbyFacilities(false);
     }
   };
+
+  const createCurrentLocationPlace = (latitude: number, longitude: number): ScenicPlaceMarker => ({
+    id: 'current-location',
+    name: '当前位置',
+    position: [latitude, longitude],
+    markerType: 'start',
+    placeKind: 'current_location',
+    category: '当前位置',
+  });
 
   const placeMarkers = useMemo(() => {
     if (!details) {
@@ -310,32 +333,38 @@ const ScenicAreaDetailPage: React.FC = () => {
   };
 
   const handleUseCurrentLocationNearby = () => {
-    if (!navigator.geolocation) {
-      message.warning('当前浏览器不支持获取定位。');
+    void (async () => {
+      const nextLocation = await requestLocation();
+      if (!nextLocation) {
+        message.warning({
+          key: 'scenic-current-location-error',
+          content: getLatestCurrentLocationError() || currentLocationError || '当前位置获取失败，请检查浏览器定位权限。',
+        });
+        return;
+      }
+
+      const currentPlace = createCurrentLocationPlace(nextLocation.latitude, nextLocation.longitude);
+      setSelectedPlace(currentPlace);
+      await runNearbyFacilitySearch(currentPlace);
+    })();
+  };
+
+  const handleToggleCurrentLocationTracking = () => {
+    if (isWatchingCurrentLocation) {
+      stopWatching();
+      message.success('已停止实时跟踪当前位置。');
       return;
     }
 
-    setResolvingCurrentLocation(true);
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        const currentPlace: ScenicPlaceMarker = {
-          id: 'current-location',
-          name: '当前位置',
-          position: [position.coords.latitude, position.coords.longitude],
-          markerType: 'start',
-          placeKind: 'current_location',
-          category: '当前位置',
-        };
-        setSelectedPlace(currentPlace);
-        void runNearbyFacilitySearch(currentPlace);
-        setResolvingCurrentLocation(false);
-      },
-      () => {
-        setResolvingCurrentLocation(false);
-        message.warning('当前位置获取失败，请检查浏览器定位权限。');
-      },
-      { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 },
-    );
+    const started = startWatching();
+    if (started) {
+      message.success('已开启实时跟踪，会持续更新当前位置并刷新附近设施。');
+    } else {
+      message.warning({
+        key: 'scenic-current-location-error',
+        content: getLatestCurrentLocationError() || currentLocationError || '当前位置获取失败，请检查浏览器定位权限。',
+      });
+    }
   };
 
   const handleUseFacilityAsCenter = (facility: Facility) => {
@@ -369,6 +398,16 @@ const ScenicAreaDetailPage: React.FC = () => {
     setSelectedPlace(defaultPlace);
     void runNearbyFacilitySearch(defaultPlace, { keyword: '' });
   }, [details, placeMarkers, selectedPlace]);
+
+  useEffect(() => {
+    if (!currentLocation || !isWatchingCurrentLocation) {
+      return;
+    }
+
+    const trackedPlace = createCurrentLocationPlace(currentLocation.latitude, currentLocation.longitude);
+    setSelectedPlace(trackedPlace);
+    void runNearbyFacilitySearch(trackedPlace);
+  }, [currentLocation, isWatchingCurrentLocation]);
 
   if (loading) {
     return (
@@ -622,11 +661,24 @@ const ScenicAreaDetailPage: React.FC = () => {
                         >
                           使用当前位置
                         </Button>
+                        <Button type={isWatchingCurrentLocation ? 'primary' : 'default'} onClick={handleToggleCurrentLocationTracking}>
+                          {isWatchingCurrentLocation ? '停止实时跟踪' : '实时跟踪当前位置'}
+                        </Button>
                         {selectedPlace ? (
                           <Button icon={<EnvironmentOutlined />} onClick={() => toFacilityQueryAroundPlace(selectedPlace)}>
                             在查询页展开
                           </Button>
                         ) : null}
+                      </Space>
+
+                      <Space wrap>
+                        {isWatchingCurrentLocation ? <Tag color="green">实时定位中</Tag> : null}
+                        {currentLocation ? (
+                          <Tag color="blue">
+                            {`定位：${currentLocation.latitude.toFixed(5)}, ${currentLocation.longitude.toFixed(5)}`}
+                          </Tag>
+                        ) : null}
+                        {currentLocationError ? <Tag color="red">{currentLocationError}</Tag> : null}
                       </Space>
 
                       {nearbyError ? <Alert type="warning" showIcon message={nearbyError} /> : null}

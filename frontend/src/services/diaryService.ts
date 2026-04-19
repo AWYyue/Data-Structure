@@ -8,6 +8,8 @@ export interface Diary {
   destination?: string;
   visitDate?: string;
   route?: string[];
+  imageUrls?: string[];
+  videoUrls?: string[];
   popularity: number;
   averageRating: number;
   reviewCount: number;
@@ -25,13 +27,16 @@ export interface DiaryComment {
   id: string;
   diaryId: string;
   userId: string;
+  parentCommentId?: string | null;
   content: string;
   rating?: number;
+  isDeleted?: boolean;
   createdAt: string;
   user?: {
     id: string;
     username: string;
   };
+  replies?: DiaryComment[];
 }
 
 export type DiarySearchMode = 'any' | 'all';
@@ -46,6 +51,8 @@ export interface DiaryService {
     destination?: string,
     visitDate?: string,
     route?: string[],
+    imageUrls?: string[],
+    videoUrls?: string[],
     isShared?: boolean,
   ) => Promise<DiaryEnvelope<Diary>>;
   getDiaryById: (id: string) => Promise<DiaryEnvelope<Diary>>;
@@ -60,11 +67,19 @@ export interface DiaryService {
     destination?: string,
     visitDate?: string,
     route?: string[],
+    imageUrls?: string[],
+    videoUrls?: string[],
     isShared?: boolean,
   ) => Promise<DiaryEnvelope<Diary>>;
   deleteDiary: (id: string) => Promise<DiaryDeleteResponse>;
   shareDiary: (id: string) => Promise<DiaryEnvelope<Diary>>;
-  addComment: (diaryId: string, content: string, rating?: number) => Promise<DiaryEnvelope<DiaryComment>>;
+  addComment: (
+    diaryId: string,
+    content: string,
+    rating?: number,
+    parentCommentId?: string,
+  ) => Promise<DiaryEnvelope<DiaryComment>>;
+  deleteComment: (diaryId: string, commentId: string) => Promise<DiaryEnvelope<DiaryComment>>;
   getDiaryComments: (diaryId: string, limit?: number, offset?: number) => Promise<DiaryEnvelope<DiaryComment[]>>;
   searchDiaries: (query: string, limit?: number, mode?: DiarySearchMode) => Promise<DiaryEnvelope<Diary[]>>;
   searchDiariesByDestination: (destination: string, limit?: number) => Promise<DiaryEnvelope<Diary[]>>;
@@ -94,8 +109,8 @@ const getSharedDiaryPool = async (limit: number, offset: number): Promise<DiaryE
 };
 
 const diaryService: DiaryService = {
-  createDiary: async (title, content, destination, visitDate, route, isShared) =>
-    api.post('/diaries', { title, content, destination, visitDate, route, isShared }),
+  createDiary: async (title, content, destination, visitDate, route, imageUrls, videoUrls, isShared) =>
+    api.post('/diaries', { title, content, destination, visitDate, route, imageUrls, videoUrls, isShared }),
 
   getDiaryById: async (id) => api.get(`/diaries/${id}`),
 
@@ -129,15 +144,18 @@ const diaryService: DiaryService = {
     };
   },
 
-  updateDiary: async (id, title, content, destination, visitDate, route, isShared) =>
-    api.put(`/diaries/${id}`, { title, content, destination, visitDate, route, isShared }),
+  updateDiary: async (id, title, content, destination, visitDate, route, imageUrls, videoUrls, isShared) =>
+    api.put(`/diaries/${id}`, { title, content, destination, visitDate, route, imageUrls, videoUrls, isShared }),
 
   deleteDiary: async (id) => api.delete(`/diaries/${id}`),
 
   shareDiary: async (id) => api.post(`/diaries/${id}/share`),
 
-  addComment: async (diaryId, content, rating) =>
-    api.post(`/diaries/${diaryId}/comments`, { content, rating }),
+  addComment: async (diaryId, content, rating, parentCommentId) =>
+    api.post(`/diaries/${diaryId}/comments`, { content, rating, parentCommentId }),
+
+  deleteComment: async (diaryId, commentId) =>
+    api.delete(`/diaries/${diaryId}/comments/${commentId}`),
 
   getDiaryComments: async (diaryId, limit = 20, offset = 0) =>
     api.get(`/diaries/${diaryId}/comments?${buildQueryString({ limit, offset })}`),
@@ -148,19 +166,8 @@ const diaryService: DiaryService = {
   searchDiariesByDestination: async (destination, limit = 10) =>
     api.get(`/diaries/search/destination?${buildQueryString({ destination, limit })}`),
 
-  searchDiariesByExactTitle: async (title, limit = 10) => {
-    const response: DiaryEnvelope<Diary[]> = await api.get(
-      `/diaries/search/query?${buildQueryString({ query: title, limit: Math.max(limit * 3, limit), mode: 'all' })}`,
-    );
-    const normalizedTitle = title.trim().toLowerCase();
-
-    return {
-      success: true,
-      data: (response.data || [])
-        .filter((item) => item.title?.trim().toLowerCase() === normalizedTitle)
-        .slice(0, limit),
-    };
-  },
+  searchDiariesByExactTitle: async (title, limit = 10) =>
+    api.get(`/diaries/search/title?${buildQueryString({ title, limit })}`),
 
   generateAnimation: async (photos, description) =>
     api.post('/diaries/generate-animation', { photos, description }),

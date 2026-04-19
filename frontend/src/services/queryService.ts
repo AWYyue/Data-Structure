@@ -62,9 +62,18 @@ export interface ImportResult {
   facilities: number;
 }
 
+export interface ScenicAreaSearchParams {
+  name?: string;
+  categories?: string[];
+  minRating?: number;
+  limit?: number;
+}
+
 export interface QueryService {
   getScenicAreaDetails: (id: string) => Promise<{ success: boolean; data: ScenicAreaDetails }>;
-  searchScenicAreas: (query: string, limit?: number) => Promise<{ success: boolean; data: ScenicArea[] }>;
+  searchScenicAreas: (params: ScenicAreaSearchParams) => Promise<{ success: boolean; data: ScenicArea[] }>;
+  searchScenicAreaSuggestions: (prefix: string, limit?: number) => Promise<{ success: boolean; data: string[] }>;
+  getScenicAreaCategories: () => Promise<{ success: boolean; data: string[] }>;
   searchFacilities: (params: {
     type?: string;
     scenicAreaId?: string;
@@ -86,8 +95,31 @@ const queryService: QueryService = {
     return api.get(`/query/scenic-area/${id}`);
   },
 
-  searchScenicAreas: async (query, limit = 10) => {
-    return api.get(`/query/scenic-areas?query=${encodeURIComponent(query)}&limit=${limit}`);
+  searchScenicAreas: async ({ name, categories = [], minRating, limit = 10 }) => {
+    const params = new URLSearchParams();
+    params.set('limit', String(limit));
+    if (name?.trim()) {
+      params.set('name', name.trim());
+    }
+    for (const category of categories) {
+      if (category.trim()) {
+        params.append('category', category.trim());
+      }
+    }
+    if (typeof minRating === 'number' && Number.isFinite(minRating)) {
+      params.set('min_rating', String(minRating));
+    }
+    return api.get(`/query/scenic-areas?${params.toString()}`);
+  },
+
+  searchScenicAreaSuggestions: async (prefix, limit = 10) => {
+    return api.get(
+      `/query/scenic-areas/suggestions?prefix=${encodeURIComponent(prefix)}&limit=${limit}`,
+    );
+  },
+
+  getScenicAreaCategories: async () => {
+    return api.get('/query/scenic-areas/categories');
   },
 
   searchFacilities: async ({ type, scenicAreaId, limit = 10, latitude, longitude, radiusKm }) => {

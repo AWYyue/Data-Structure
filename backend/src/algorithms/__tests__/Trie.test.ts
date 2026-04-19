@@ -1,4 +1,4 @@
-import { Trie } from '../Trie';
+import { buildTrieFromWords, Trie } from '../Trie';
 
 describe('Trie', () => {
   it('supports exact and prefix search', () => {
@@ -8,6 +8,7 @@ describe('Trie', () => {
     trie.insert('Beijing Museum', 'museum');
 
     expect(trie.searchExact('  beijing museum ')).toEqual(['museum']);
+    expect(trie.searchPrefix('北京')).toEqual(expect.arrayContaining(['北京大学', '北京天安门']));
 
     const prefixHits = trie.searchByPrefix('北京');
     expect(prefixHits).toContain('pku');
@@ -23,5 +24,12 @@ describe('Trie', () => {
     trie.clear();
     expect(trie.size()).toBe(0);
     expect(trie.searchByPrefix('alp')).toEqual([]);
+  });
+
+  it('supports bulk initialization from a scenic name list', () => {
+    const trie = buildTrieFromWords(['博物馆公园', '博物馆广场', '城市公园']);
+
+    expect(trie.searchPrefix('博物')).toEqual(['博物馆公园', '博物馆广场']);
+    expect(trie.searchExactWords('城市公园')).toEqual(['城市公园']);
   });
 });

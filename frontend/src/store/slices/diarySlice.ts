@@ -27,6 +27,8 @@ export const createDiary = createAsyncThunk(
       destination,
       visitDate,
       route,
+      imageUrls,
+      videoUrls,
       isShared,
     }: {
       title: string;
@@ -34,6 +36,8 @@ export const createDiary = createAsyncThunk(
       destination?: string;
       visitDate?: string;
       route?: string[];
+      imageUrls?: string[];
+      videoUrls?: string[];
       isShared?: boolean;
     },
     { rejectWithValue },
@@ -46,6 +50,8 @@ export const createDiary = createAsyncThunk(
         destination,
         visitDate,
         route,
+        imageUrls,
+        videoUrls,
         isShared,
       );
       if (response.success) {
@@ -119,6 +125,8 @@ export const updateDiary = createAsyncThunk(
       destination,
       visitDate,
       route,
+      imageUrls,
+      videoUrls,
       isShared,
     }: {
       id: string;
@@ -127,6 +135,8 @@ export const updateDiary = createAsyncThunk(
       destination?: string;
       visitDate?: string;
       route?: string[];
+      imageUrls?: string[];
+      videoUrls?: string[];
       isShared?: boolean;
     },
     { rejectWithValue },
@@ -140,6 +150,8 @@ export const updateDiary = createAsyncThunk(
         destination,
         visitDate,
         route,
+        imageUrls,
+        videoUrls,
         isShared,
       );
       if (response.success) {

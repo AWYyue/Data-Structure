@@ -6,14 +6,42 @@ import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 import { v4 as uuidv4 } from 'uuid';
 import { normalizeStringArray } from '../utils/stringArrayField';
+import { Like } from 'typeorm';
 
 dotenv.config();
 
 let memoryUsers: User[] = [];
 let memoryNextId = 1;
 
+const USERNAME_PATTERN = /^[A-Za-z][A-Za-z0-9]*$/;
+const PASSWORD_MIN_LENGTH = 8;
+const CUSTOM_USER_EMAIL_SUFFIX = '@local.user';
+const MAX_CUSTOM_USER_COUNT = 10;
+
+const createVirtualEmail = (username: string) => `${username}${CUSTOM_USER_EMAIL_SUFFIX}`;
+
+const validateUsername = (username: string) => {
+  if (!username.trim()) {
+    throw new Error('请输入用户名');
+  }
+
+  if (!USERNAME_PATTERN.test(username)) {
+    throw new Error('用户名必须以英文开头，且只能包含英文和数字');
+  }
+};
+
+const validatePassword = (password: string) => {
+  if (!password) {
+    throw new Error('请输入密码');
+  }
+
+  if (password.length < PASSWORD_MIN_LENGTH) {
+    throw new Error('密码至少需要 8 位');
+  }
+};
+
 function getUserRepository() {
-  if (AppDataSource) {
+  if (AppDataSource?.isInitialized) {
     return AppDataSource.getRepository(User);
   }
   return null;
@@ -24,6 +52,20 @@ function getMemoryUser(identity: string): User | undefined {
 }
 
 export class UserService {
+  private async countCustomUsers(): Promise<number> {
+    const userRepository = getUserRepository();
+
+    if (userRepository) {
+      return userRepository.count({
+        where: {
+          email: Like(`%${CUSTOM_USER_EMAIL_SUFFIX}`),
+        },
+      });
+    }
+
+    return memoryUsers.filter((user) => user.email.endsWith(CUSTOM_USER_EMAIL_SUFFIX)).length;
+  }
+
   private async repairInvalidUserId(user: User): Promise<User> {
     if (user.id && user.id.trim()) {
       return user;
@@ -46,7 +88,6 @@ export class UserService {
         ]);
         await queryRunner.query('UPDATE "diaries" SET "userId" = ? WHERE "userId" = ?', [nextId, '']);
         await queryRunner.query('UPDATE "diary_comments" SET "userId" = ? WHERE "userId" = ?', [nextId, '']);
-        await queryRunner.query('UPDATE "achievements" SET "userId" = ? WHERE "userId" = ?', [nextId, '']);
         await queryRunner.query('UPDATE "photo_checkins" SET "userId" = ? WHERE "userId" = ?', [nextId, '']);
         await queryRunner.query('UPDATE "social_checkins" SET "userId" = ? WHERE "userId" = ?', [nextId, '']);
         await queryRunner.query('UPDATE "social_team_members" SET "userId" = ? WHERE "userId" = ?', [nextId, '']);
@@ -112,30 +153,40 @@ export class UserService {
 
   async register(userData: {
     username: string;
-    email: string;
     password: string;
   }): Promise<User> {
+    const username = String(userData.username || '').trim();
+    const password = String(userData.password || '');
+    validateUsername(username);
+    validatePassword(password);
+
     const userRepository = getUserRepository();
     let existingUser;
 
     if (userRepository) {
       existingUser = await userRepository.findOne({
-        where: [{ username: userData.username }, { email: userData.email }],
+        where: { username },
       });
     } else {
-      existingUser = getMemoryUser(userData.username) || getMemoryUser(userData.email);
+      existingUser = memoryUsers.find((user) => user.username === username);
     }
 
     if (existingUser) {
-      throw new Error('Username or email already exists');
+      throw new Error('该用户名已存在');
     }
 
-    const passwordHash = await bcrypt.hash(userData.password, 10);
+    const customUserCount = await this.countCustomUsers();
+    if (customUserCount >= MAX_CUSTOM_USER_COUNT) {
+      throw new Error(`当前最多支持 ${MAX_CUSTOM_USER_COUNT} 个自注册用户`);
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const email = createVirtualEmail(username);
 
     if (userRepository) {
       const user = userRepository.create({
-        username: userData.username,
-        email: userData.email,
+        username,
+        email,
         passwordHash,
         interests: [],
         interestWeights: {
@@ -151,13 +202,14 @@ export class UserService {
         favorites: [],
         dislikedCategories: [],
       });
-      return await userRepository.save(user);
+      const savedUser = await userRepository.save(user);
+      return this.repairInvalidUserId(savedUser);
     }
 
     const user = {
       id: `memory-${memoryNextId++}`,
-      username: userData.username,
-      email: userData.email,
+      username,
+      email,
       passwordHash,
       interests: [],
       interestWeights: {
@@ -173,7 +225,6 @@ export class UserService {
       favorites: [],
       dislikedCategories: [],
       behaviors: [],
-      achievements: [],
       diaries: [],
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -187,24 +238,26 @@ export class UserService {
     username: string;
     password: string;
   }): Promise<{ user: User; token: string }> {
+    const username = String(credentials.username || '').trim();
+    const password = String(credentials.password || '');
     const userRepository = getUserRepository();
     let user: User | null = null;
 
     if (userRepository) {
       user = await userRepository.findOne({
-        where: { username: credentials.username },
+        where: { username },
       });
     } else {
-      user = getMemoryUser(credentials.username) || null;
+      user = memoryUsers.find((item) => item.username === username) || null;
     }
 
     if (!user) {
-      throw new Error('Invalid username or password');
+      throw new Error('用户名或密码错误');
     }
 
-    const isPasswordValid = await bcrypt.compare(credentials.password, user.passwordHash);
+    const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
     if (!isPasswordValid) {
-      throw new Error('Invalid username or password');
+      throw new Error('用户名或密码错误');
     }
 
     user = await this.repairInvalidUserId(user);
@@ -241,6 +294,38 @@ export class UserService {
 
   async getUserById(userId: string): Promise<User | null> {
     return this.getUserByIdentity(userId);
+  }
+
+  async updatePassword(userId: string, currentPassword: string, newPassword: string): Promise<User> {
+    const user = await this.getUserByIdentity(userId);
+    const userRepository = getUserRepository();
+    const nextPassword = String(newPassword || '');
+    const previousPassword = String(currentPassword || '');
+
+    if (!user) {
+      throw new Error('用户不存在');
+    }
+
+    validatePassword(nextPassword);
+
+    const isPasswordValid = await bcrypt.compare(previousPassword, user.passwordHash);
+    if (!isPasswordValid) {
+      throw new Error('当前密码不正确');
+    }
+
+    user.passwordHash = await bcrypt.hash(nextPassword, 10);
+
+    if (userRepository) {
+      return userRepository.save(user);
+    }
+
+    const index = memoryUsers.findIndex((item) => item.id === user.id);
+    if (index !== -1) {
+      memoryUsers[index] = { ...user, updatedAt: new Date() };
+      return memoryUsers[index];
+    }
+
+    return user;
   }
 
   verifyToken(token: string): { userId: string; username: string } {

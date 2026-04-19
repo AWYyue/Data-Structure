@@ -33,6 +33,7 @@ const { TextArea } = Input;
 type DiaryTab = 'mine' | 'community' | 'search' | 'popularity' | 'rating';
 type SearchMode = 'any' | 'all';
 type SearchType = 'fulltext' | 'destination' | 'title_exact';
+type ReplyDraftMap = Record<string, string>;
 
 type DiaryFormValues = {
   title: string;
@@ -75,7 +76,7 @@ const readFileAsDataUrl = (file: File): Promise<string> =>
   new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result || ''));
-    reader.onerror = () => reject(new Error('读取图片失败'));
+    reader.onerror = () => reject(new Error('读取文件失败'));
     reader.readAsDataURL(file);
   });
 
@@ -146,6 +147,12 @@ const DiaryPage: React.FC = () => {
   const [commentText, setCommentText] = useState('');
   const [commentRating, setCommentRating] = useState<number>(5);
   const [commentLoading, setCommentLoading] = useState(false);
+  const [diaryImageUrls, setDiaryImageUrls] = useState<string[]>([]);
+  const [diaryVideoUrls, setDiaryVideoUrls] = useState<string[]>([]);
+  const [replyDrafts, setReplyDrafts] = useState<ReplyDraftMap>({});
+  const [activeReplyId, setActiveReplyId] = useState<string | null>(null);
+  const [replyLoadingId, setReplyLoadingId] = useState<string | null>(null);
+  const [commentDeletingId, setCommentDeletingId] = useState<string | null>(null);
   const [animationPhotos, setAnimationPhotos] = useState<string[]>([]);
   const [animationDescription, setAnimationDescription] = useState('');
   const [animationLoading, setAnimationLoading] = useState(false);
@@ -154,6 +161,10 @@ const DiaryPage: React.FC = () => {
   const [form] = Form.useForm<DiaryFormValues>();
   const hasLoginToken = Boolean(token);
   const isRestoringLogin = hasLoginToken && !user?.id && userLoading;
+  const maxDiaryPhotoCount = 6;
+  const maxDiaryPayloadBytes = 8 * 1024 * 1024;
+  const maxDiaryVideoCount = 2;
+  const maxDiaryVideoPayloadBytes = 24 * 1024 * 1024;
   const maxAnimationPhotoCount = 6;
   const maxAnimationPayloadBytes = 8 * 1024 * 1024;
 
@@ -224,6 +235,8 @@ const DiaryPage: React.FC = () => {
 
   const openCreateModal = (diary?: Diary) => {
     setEditingDiary(diary || null);
+    setDiaryImageUrls(diary?.imageUrls || []);
+    setDiaryVideoUrls(diary?.videoUrls || []);
     setModalVisible(true);
     form.setFieldsValue({
       title: diary?.title || '',
@@ -236,6 +249,8 @@ const DiaryPage: React.FC = () => {
   const closeCreateModal = () => {
     setModalVisible(false);
     setEditingDiary(null);
+    setDiaryImageUrls([]);
+    setDiaryVideoUrls([]);
     form.resetFields();
   };
 
@@ -264,6 +279,8 @@ const DiaryPage: React.FC = () => {
           values.destination,
           undefined,
           undefined,
+          diaryImageUrls,
+          diaryVideoUrls,
           Boolean(values.isShared),
         );
         message.success('日记已更新。');
@@ -274,6 +291,8 @@ const DiaryPage: React.FC = () => {
           values.destination,
           undefined,
           undefined,
+          diaryImageUrls,
+          diaryVideoUrls,
           Boolean(values.isShared),
         );
         message.success('日记已创建。');
@@ -304,16 +323,21 @@ const DiaryPage: React.FC = () => {
     }
   };
 
+  const refreshDiaryDetail = async (diaryId: string, fallbackDiary?: Diary) => {
+    const [detailResp, commentsResp] = await Promise.all([
+      diaryService.getDiaryById(diaryId),
+      diaryService.getDiaryComments(diaryId, 50, 0),
+    ]);
+    setDetailDiary(detailResp.data || fallbackDiary || null);
+    setDetailComments(commentsResp.data || []);
+  };
+
   const openDiaryDetail = async (diary: Diary) => {
     setDetailVisible(true);
     setDetailDiary(diary);
     try {
-      const [detailResp, commentsResp] = await Promise.all([
-        diaryService.getDiaryById(diary.id),
-        diaryService.getDiaryComments(diary.id, 50, 0),
-      ]);
-      setDetailDiary(detailResp.data);
-      setDetailComments(commentsResp.data || []);
+      await refreshDiaryDetail(diary.id, diary);
+      await Promise.all([loadCommunity(), loadPopularityRanking(), loadRatingRanking()]);
     } catch (error: unknown) {
       message.error(resolveErrorMessage(error, '加载日记详情失败。'));
     }
@@ -325,6 +349,10 @@ const DiaryPage: React.FC = () => {
     setDetailComments([]);
     setCommentText('');
     setCommentRating(5);
+    setReplyDrafts({});
+    setActiveReplyId(null);
+    setReplyLoadingId(null);
+    setCommentDeletingId(null);
   };
 
   const handleCommentSubmit = async () => {
@@ -340,12 +368,7 @@ const DiaryPage: React.FC = () => {
     setCommentLoading(true);
     try {
       await diaryService.addComment(detailDiary.id, commentText.trim(), commentRating);
-      const [detailResp, commentsResp] = await Promise.all([
-        diaryService.getDiaryById(detailDiary.id),
-        diaryService.getDiaryComments(detailDiary.id, 50, 0),
-      ]);
-      setDetailDiary(detailResp.data);
-      setDetailComments(commentsResp.data || []);
+      await refreshDiaryDetail(detailDiary.id, detailDiary);
       setCommentText('');
       setCommentRating(5);
       message.success('评论已发布。');
@@ -354,6 +377,60 @@ const DiaryPage: React.FC = () => {
       message.error(resolveErrorMessage(error, '评论失败，请稍后重试。'));
     } finally {
       setCommentLoading(false);
+    }
+  };
+
+  const handleReplyDraftChange = (commentId: string, value: string) => {
+    setReplyDrafts((current) => ({
+      ...current,
+      [commentId]: value,
+    }));
+  };
+
+  const handleReplySubmit = async (commentId: string) => {
+    if (!detailDiary?.id) {
+      return;
+    }
+
+    const replyText = (replyDrafts[commentId] || '').trim();
+    if (!replyText) {
+      message.warning('请输入回复内容。');
+      return;
+    }
+
+    setReplyLoadingId(commentId);
+    try {
+      await diaryService.addComment(detailDiary.id, replyText, undefined, commentId);
+      await refreshDiaryDetail(detailDiary.id, detailDiary);
+      setReplyDrafts((current) => ({
+        ...current,
+        [commentId]: '',
+      }));
+      setActiveReplyId(null);
+      message.success('回复已发布。');
+      await Promise.all([loadCommunity(), loadPopularityRanking(), loadRatingRanking()]);
+    } catch (error: unknown) {
+      message.error(resolveErrorMessage(error, '回复失败，请稍后重试。'));
+    } finally {
+      setReplyLoadingId(null);
+    }
+  };
+
+  const handleDeleteComment = async (commentId: string) => {
+    if (!detailDiary?.id) {
+      return;
+    }
+
+    setCommentDeletingId(commentId);
+    try {
+      await diaryService.deleteComment(detailDiary.id, commentId);
+      await refreshDiaryDetail(detailDiary.id, detailDiary);
+      message.success('评论已处理。');
+      await Promise.all([loadCommunity(), loadPopularityRanking(), loadRatingRanking()]);
+    } catch (error: unknown) {
+      message.error(resolveErrorMessage(error, '评论管理失败，请稍后重试。'));
+    } finally {
+      setCommentDeletingId(null);
     }
   };
 
@@ -445,6 +522,128 @@ const DiaryPage: React.FC = () => {
     setAnimationPhotos((current) => current.filter((item) => item !== target));
   };
 
+  const handleDiaryImageUpload = async (file: File) => {
+    if (diaryImageUrls.length >= maxDiaryPhotoCount) {
+      message.warning(`日记图片最多上传 ${maxDiaryPhotoCount} 张。`);
+      return Upload.LIST_IGNORE;
+    }
+
+    try {
+      const compressedPhoto = await compressImageToDataUrl(file);
+      const nextPhotos = [...diaryImageUrls, compressedPhoto];
+      const totalBytes = nextPhotos.reduce((sum, item) => sum + estimateBase64Bytes(item), 0);
+
+      if (totalBytes > maxDiaryPayloadBytes) {
+        message.warning('日记图片总大小过大，请减少图片数量或更换更小的图片。');
+        return Upload.LIST_IGNORE;
+      }
+
+      setDiaryImageUrls(nextPhotos);
+      message.success(`已添加日记图片：${file.name}`);
+    } catch (error: unknown) {
+      message.error(resolveErrorMessage(error, '日记图片处理失败，请更换图片后重试。'));
+    }
+
+    return Upload.LIST_IGNORE;
+  };
+
+  const handleRemoveDiaryImage = (target: string) => {
+    setDiaryImageUrls((current) => current.filter((item) => item !== target));
+  };
+
+  const handleDiaryVideoUpload = async (file: File) => {
+    if (diaryVideoUrls.length >= maxDiaryVideoCount) {
+      message.warning(`日记视频最多上传 ${maxDiaryVideoCount} 段。`);
+      return Upload.LIST_IGNORE;
+    }
+
+    try {
+      const videoDataUrl = await readFileAsDataUrl(file);
+      const nextVideos = [...diaryVideoUrls, videoDataUrl];
+      const totalBytes = nextVideos.reduce((sum, item) => sum + estimateBase64Bytes(item), 0);
+
+      if (totalBytes > maxDiaryVideoPayloadBytes) {
+        message.warning('日记视频总大小过大，请减少视频数量或更换更小的文件。');
+        return Upload.LIST_IGNORE;
+      }
+
+      setDiaryVideoUrls(nextVideos);
+      message.success(`已添加日记视频：${file.name}`);
+    } catch (error: unknown) {
+      message.error(resolveErrorMessage(error, '日记视频处理失败，请更换文件后重试。'));
+    }
+
+    return Upload.LIST_IGNORE;
+  };
+
+  const handleRemoveDiaryVideo = (target: string) => {
+    setDiaryVideoUrls((current) => current.filter((item) => item !== target));
+  };
+
+  const canManageComment = (comment: DiaryComment) =>
+    Boolean(user?.id && detailDiary && (comment.userId === user.id || detailDiary.userId === user.id));
+
+  const renderCommentItems = (comments: DiaryComment[], depth = 0): React.ReactNode =>
+    comments.map((comment) => (
+      <div
+        key={comment.id}
+        style={{
+          marginLeft: depth > 0 ? 20 : 0,
+          marginTop: depth > 0 ? 12 : 0,
+          padding: '14px 16px',
+          borderRadius: 14,
+          border: '1px solid rgba(148,163,184,0.18)',
+          background: depth > 0 ? 'rgba(248,250,252,0.78)' : 'rgba(255,255,255,0.9)',
+        }}
+      >
+        <Space direction="vertical" size={10} style={{ width: '100%' }}>
+          <Space wrap style={{ justifyContent: 'space-between', width: '100%' }}>
+            <Space wrap>
+              <Text strong>{comment.user?.username || '游客'}</Text>
+              {typeof comment.rating === 'number' ? <Rate disabled value={Number(comment.rating)} /> : null}
+              <Text type="secondary">{new Date(comment.createdAt).toLocaleString()}</Text>
+            </Space>
+            <Space wrap size={4}>
+              {hasLoginToken ? (
+                <Button type="link" size="small" onClick={() => setActiveReplyId(activeReplyId === comment.id ? null : comment.id)}>
+                  回复
+                </Button>
+              ) : null}
+              {canManageComment(comment) ? (
+                <Button
+                  type="link"
+                  size="small"
+                  danger
+                  loading={commentDeletingId === comment.id}
+                  onClick={() => handleDeleteComment(comment.id)}
+                >
+                  删除
+                </Button>
+              ) : null}
+            </Space>
+          </Space>
+          <Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>{comment.content}</Paragraph>
+          {activeReplyId === comment.id && hasLoginToken ? (
+            <Space direction="vertical" size={8} style={{ width: '100%' }}>
+              <Input.TextArea
+                rows={3}
+                value={replyDrafts[comment.id] || ''}
+                onChange={(event) => handleReplyDraftChange(comment.id, event.target.value)}
+                placeholder="写下你的回复..."
+              />
+              <Space>
+                <Button type="primary" loading={replyLoadingId === comment.id} onClick={() => handleReplySubmit(comment.id)}>
+                  发布回复
+                </Button>
+                <Button onClick={() => setActiveReplyId(null)}>取消</Button>
+              </Space>
+            </Space>
+          ) : null}
+          {comment.replies?.length ? renderCommentItems(comment.replies, depth + 1) : null}
+        </Space>
+      </div>
+    ));
+
   const renderDiaryList = (items: Diary[], showMineAction = false, highlightQuery = '') =>
     items.length > 0 ? (
       <List
@@ -475,6 +674,8 @@ const DiaryPage: React.FC = () => {
               title={
                 <Space wrap>
                   <Text strong>{item.title}</Text>
+                  {item.imageUrls?.length ? <Tag color="purple">图片 {item.imageUrls.length}</Tag> : null}
+                  {item.videoUrls?.length ? <Tag color="cyan">视频 {item.videoUrls.length}</Tag> : null}
                   {item.isShared ? <Tag color="green">已分享</Tag> : <Tag>未分享</Tag>}
                   <Tag color="orange">热度 {item.popularity || 0}</Tag>
                   <Tag color="blue">评分 {Number(item.averageRating || 0).toFixed(1)}</Tag>
@@ -486,9 +687,33 @@ const DiaryPage: React.FC = () => {
                     作者：{item.user?.username || '未知用户'} · 目的地：{item.destination || '未填写'} · 创建时间：
                     {new Date(item.createdAt).toLocaleString()}
                   </Text>
-                  <Paragraph style={{ marginBottom: 0 }} ellipsis={{ rows: 2 }}>
+                  <Paragraph style={{ marginBottom: 0 }} ellipsis={{ rows: 5 }}>
                     {highlightQuery ? highlightText(item.content || '', highlightQuery) : item.content}
                   </Paragraph>
+                  {item.imageUrls?.length ? (
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
+                      {item.imageUrls.slice(0, 3).map((url, index) => (
+                        <img
+                          key={`${item.id}-thumb-${index}`}
+                          src={url}
+                          alt={`${item.title}-thumb-${index + 1}`}
+                          style={{ width: 84, height: 64, objectFit: 'cover', borderRadius: 10, border: '1px solid rgba(148,163,184,0.2)' }}
+                        />
+                      ))}
+                    </div>
+                  ) : null}
+                  {item.videoUrls?.length ? (
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
+                      {item.videoUrls.slice(0, 1).map((url, index) => (
+                        <video
+                          key={`${item.id}-video-${index}`}
+                          src={url}
+                          controls
+                          style={{ width: 180, height: 104, borderRadius: 12, background: '#0f172a' }}
+                        />
+                      ))}
+                    </div>
+                  ) : null}
                 </Space>
               }
             />
@@ -684,10 +909,10 @@ const DiaryPage: React.FC = () => {
                   style={{ marginTop: 8 }}
                   placeholder={
                     searchType === 'fulltext'
-                      ? '例如：美食 夜景 打卡'
+                      ? '例如：北京 博物馆 慢游'
                       : searchType === 'destination'
-                        ? '例如：故宫'
-                        : '请输入完整标题'
+                        ? '例如：博物馆 / 天坛'
+                        : '例如：天坛的风从祈年殿吹来：北京一日散记'
                   }
                   value={searchKeyword}
                   onChange={(event) => setSearchKeyword(event.target.value)}
@@ -715,16 +940,83 @@ const DiaryPage: React.FC = () => {
         footer={null}
         destroyOnHidden
         forceRender
+        width={980}
       >
         <Form<DiaryFormValues> form={form} layout="vertical" onFinish={handleCreateOrUpdate}>
           <Form.Item name="title" label="日记标题" rules={[{ required: true, message: '请输入日记标题。' }]}>
             <Input placeholder="例如：故宫一日游实录" />
           </Form.Item>
           <Form.Item name="content" label="日记内容" rules={[{ required: true, message: '请输入日记内容。' }]}>
-            <TextArea rows={5} placeholder="记录你的路线、见闻、体验和建议..." />
+            <TextArea rows={10} placeholder="记录你的路线、见闻、体验和建议..." />
           </Form.Item>
           <Form.Item name="destination" label="目的地">
             <Input placeholder="例如：故宫 / 清华大学" />
+          </Form.Item>
+          <Form.Item label="日记图片">
+            <Space direction="vertical" size={10} style={{ width: '100%' }}>
+              <Upload beforeUpload={handleDiaryImageUpload} showUploadList={false} accept="image/*">
+                <Button>上传图片</Button>
+              </Upload>
+              {diaryImageUrls.length ? (
+                <List
+                  size="small"
+                  dataSource={diaryImageUrls}
+                  renderItem={(url, index) => (
+                    <List.Item
+                      actions={[
+                        <Button key={`remove-${index}`} type="link" danger onClick={() => handleRemoveDiaryImage(url)}>
+                          删除
+                        </Button>,
+                      ]}
+                    >
+                      <Space>
+                        <img
+                          src={url}
+                          alt={`diary-upload-${index + 1}`}
+                          style={{ width: 88, height: 64, objectFit: 'cover', borderRadius: 10, border: '1px solid rgba(148,163,184,0.2)' }}
+                        />
+                        <Text type="secondary">第 {index + 1} 张图片</Text>
+                      </Space>
+                    </List.Item>
+                  )}
+                />
+              ) : (
+                <Text type="secondary">可上传最多 6 张图片，用于旅行日记展示。</Text>
+              )}
+            </Space>
+          </Form.Item>
+          <Form.Item label="日记视频">
+            <Space direction="vertical" size={10} style={{ width: '100%' }}>
+              <Upload beforeUpload={handleDiaryVideoUpload} showUploadList={false} accept="video/*">
+                <Button>上传视频</Button>
+              </Upload>
+              {diaryVideoUrls.length ? (
+                <List
+                  size="small"
+                  dataSource={diaryVideoUrls}
+                  renderItem={(url, index) => (
+                    <List.Item
+                      actions={[
+                        <Button key={`remove-video-${index}`} type="link" danger onClick={() => handleRemoveDiaryVideo(url)}>
+                          删除
+                        </Button>,
+                      ]}
+                    >
+                      <Space align="start">
+                        <video
+                          src={url}
+                          controls
+                          style={{ width: 180, height: 104, borderRadius: 12, background: '#0f172a' }}
+                        />
+                        <Text type="secondary">第 {index + 1} 段视频</Text>
+                      </Space>
+                    </List.Item>
+                  )}
+                />
+              ) : (
+                <Text type="secondary">可上传最多 2 段视频，用于更完整地展示旅行日记。</Text>
+              )}
+            </Space>
           </Form.Item>
           <Form.Item name="isShared" valuePropName="checked">
             <Checkbox>分享至社区</Checkbox>
@@ -735,9 +1027,9 @@ const DiaryPage: React.FC = () => {
         </Form>
       </Modal>
 
-      <Modal title={detailDiary?.title || '日记详情'} open={detailVisible} onCancel={closeDiaryDetail} footer={null} width={860}>
+      <Modal title={detailDiary?.title || '日记详情'} open={detailVisible} onCancel={closeDiaryDetail} footer={null} width={980}>
         {detailDiary ? (
-          <Space direction="vertical" size={14} style={{ width: '100%' }}>
+          <Space direction="vertical" size={18} style={{ width: '100%' }}>
             <Space wrap>
               <Tag color="orange">热度 {detailDiary.popularity || 0}</Tag>
               <Tag color="blue">评分 {Number(detailDiary.averageRating || 0).toFixed(1)}</Tag>
@@ -747,40 +1039,60 @@ const DiaryPage: React.FC = () => {
               作者：{detailDiary.user?.username || '未知用户'} · 目的地：{detailDiary.destination || '未填写'} · 发布时间：
               {new Date(detailDiary.createdAt).toLocaleString()}
             </Text>
-            <Paragraph style={{ whiteSpace: 'pre-wrap', marginBottom: 0 }}>{detailDiary.content || '暂无内容'}</Paragraph>
+            <Paragraph style={{ whiteSpace: 'pre-wrap', marginBottom: 0, fontSize: 16, lineHeight: 1.9 }}>
+              {detailDiary.content || '暂无内容'}
+            </Paragraph>
+
+            {detailDiary.imageUrls?.length ? (
+              <List
+                grid={{ gutter: 12, xs: 1, sm: 2, md: 3 }}
+                dataSource={detailDiary.imageUrls}
+                renderItem={(url, index) => (
+                  <List.Item>
+                    <img
+                      src={url}
+                      alt={`${detailDiary.title}-image-${index + 1}`}
+                      style={{ width: '100%', height: 180, objectFit: 'cover', borderRadius: 16, border: '1px solid rgba(148,163,184,0.2)' }}
+                    />
+                  </List.Item>
+                )}
+              />
+            ) : null}
+
+            {detailDiary.videoUrls?.length ? (
+              <List
+                grid={{ gutter: 12, xs: 1, md: 2 }}
+                dataSource={detailDiary.videoUrls}
+                renderItem={(url) => (
+                  <List.Item>
+                    <video
+                      src={url}
+                      controls
+                      style={{ width: '100%', maxHeight: 280, borderRadius: 16, background: '#0f172a' }}
+                    />
+                  </List.Item>
+                )}
+              />
+            ) : null}
 
             <Card size="small" title="评论区">
               {detailComments.length > 0 ? (
-                <List
-                  dataSource={detailComments}
-                  renderItem={(comment) => (
-                    <List.Item>
-                      <List.Item.Meta
-                        title={
-                          <Space wrap>
-                            <Text strong>{comment.user?.username || '游客'}</Text>
-                            {typeof comment.rating === 'number' ? <Rate disabled value={Number(comment.rating)} /> : null}
-                            <Text type="secondary">{new Date(comment.createdAt).toLocaleString()}</Text>
-                          </Space>
-                        }
-                        description={comment.content}
-                      />
-                    </List.Item>
-                  )}
-                />
+                <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                  {renderCommentItems(detailComments)}
+                </Space>
               ) : (
                 <Empty description="暂无评论" />
               )}
 
               {hasLoginToken ? (
-                <Space direction="vertical" size={8} style={{ width: '100%', marginTop: 8 }}>
-                  <Text strong>发表你的评论</Text>
+                <Space direction="vertical" size={8} style={{ width: '100%', marginTop: 16 }}>
+                  <Text strong>发表评论</Text>
                   <Rate value={commentRating} onChange={setCommentRating} />
                   <Input.TextArea
-                    rows={3}
+                    rows={4}
                     value={commentText}
                     onChange={(event) => setCommentText(event.target.value)}
-                    placeholder="写下你的游览体验和建议..."
+                    placeholder="写下你的游览体验、建议或补充信息..."
                   />
                   <Button type="primary" loading={commentLoading} onClick={handleCommentSubmit}>
                     提交评论
